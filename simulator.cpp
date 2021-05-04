@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+
 #include <iostream>
 #include <cmath>
 #include <vector>
@@ -9,8 +11,8 @@ using namespace std;
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
 struct sparse_elt {
-    int u;
-    int v;
+    long u;
+    long v;
     complex<double> amp;
 };
 
@@ -34,17 +36,17 @@ bool isNormalized (vector<complex<double> > state) {
     return (abs(1.0 - sum) < 1e-15);
 }
 
-vector<complex<double> > uniform(const int N) {
+vector<complex<double> > uniform(const long N) {
     vector<complex<double> > state;
     state.assign(N, sqrt(1.0/N));
     return state;
 }
-vector<complex<double> > zero(const int N) {
+vector<complex<double> > zero(const long N) {
     vector<complex<double> > state;
     state.assign(N, 0);
     return state;
 }
-vector<complex<double> > classical(const int N, const int init) {
+vector<complex<double> > classical(const long N, const int init) {
     vector<complex<double> > state = zero(N);
     state.data()[init] = 1.0;
     return state;
@@ -77,7 +79,7 @@ vector<sparse_elt> tensor(vector<sparse_elt> u1, vector<sparse_elt> u2) {
 void printComplex(complex<double> amplitude) {
     cout << "(" << real(amplitude) << "+" << imag(amplitude) << "i)";
 }
-void printVec(vector<complex<double> > state, const int n, const int N, bool printAll) {
+void printVec(vector<complex<double> > state, const int n, const long N, bool printAll) {
     cout << "State:\n";
     for (int i = 0; i < N; ++i) {
         if (!printAll && equalsZero(state.at(i)))
@@ -91,7 +93,7 @@ void printVec(vector<complex<double> > state, const int n, const int N, bool pri
         cout << "\n";
     }
 }
-void printVecProbs(vector<complex<double> > state, const int n, const int N, bool printAll) {
+void printVecProbs(vector<complex<double> > state, const int n, const long N, bool printAll) {
     cout << "Probability distribution:\n";
     for (int i = 0; i < N; ++i) {
         if (!printAll && equalsZero(state.at(i)))
@@ -104,19 +106,34 @@ void printVecProbs(vector<complex<double> > state, const int n, const int N, boo
         cout << "|Psi>|^2 = " << norm(state.at(i)) << "\n";
     }
 }
+
 void printOp(vector<sparse_elt> U) {
     vector<vector<complex<double> > > densified;
     int dim = U.begin()->u;
     densified.assign(dim, zero(dim));
-    for (auto x = U.begin()+1; x != U.end(); x++) {
+    for (auto x = U.begin()+1; x != U.end(); ++x) {
         densified.data()[x->u].data()[x->v] += x->amp;
     }
-    for (int x = 0; x < dim; x++) {
-        for (int y = 0; y < dim; y++) {
+    for (int x = 0; x < dim; ++x) {
+        for (int y = 0; y < dim; ++y) {
             cout << densified.data()[x].data()[y] << " ";
         }
         cout << "\n";
     }
+}
+
+long getMostLikely(vector<complex<double> > state, int n) {
+    long ans = -1;
+    double prob = 0.0;
+    long N = pow(2, n);
+    for (long i = 0; i < N; i++) {
+        cout << norm(state.data()[i]) << " ";
+        if (norm(state.data()[i]) > prob) {
+            prob = norm(state.data()[i]);
+            ans = i;
+        }
+    }
+    return ans;
 }
 
 /* One qubit gates */ 
@@ -151,6 +168,16 @@ vector<sparse_elt> hadamard() {
     had.push_back(createElt(1, 1, -norm));
     return had;
 }
+vector<sparse_elt> phase(double phi){
+    vector<sparse_elt> pha;
+    // dimensions
+    pha.push_back(createElt(2,2, 0.0));
+    // values
+    pha.push_back(createElt(0,0, 1.0));
+    complex<double> exp (cos(phi), sin(phi));
+    pha.push_back(createElt(1,1,exp));
+    return pha;
+}
 
 
 /* Expanding operations for 1 qubit gates. */
@@ -158,7 +185,7 @@ vector<sparse_elt> hadamard() {
 /* It is much more efficient to do many 1 qubit gates sequentially than to compute their tensor product */
 vector<sparse_elt> oneQubitGateExpand(vector<sparse_elt> oneQubitGate, const int n, const int which) {
     vector<sparse_elt> total = (which == 0 ? oneQubitGate : identity());
-    for(int i = 1; i < n; i++) {
+    for(int i = 1; i < n; ++i) {
         if(which == i) 
             total = tensor(total, oneQubitGate);
         else
@@ -171,10 +198,10 @@ vector<sparse_elt> oneQubitGateExpand(vector<sparse_elt> oneQubitGate, const int
 /* Two qubit gates */
 vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) { 
     vector<sparse_elt> cnot;
-    int N = pow(2, n);
+    long N = pow(2, n);
     cnot.push_back(createElt(N, N, 0.0));
     int j;
-    for(int i = 0; i < N; i++) {
+    for(int i = 0; i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             j = i ^ (0x1<<(n-v-1));
             cnot.push_back(createElt(i, j, 1.0));
@@ -186,10 +213,10 @@ vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) {
 }
 vector<sparse_elt> CU1Expanded(vector<sparse_elt> U1, const int n, const int u, const int v) {
     vector<sparse_elt> CU1;
-    int N = pow(2, n);
+    long N = pow(2, n);
     CU1.push_back(createElt(N, N, 0.0));
     vector<complex<double> > stateOfV;
-    for(long i = 0; i < N; i++) {
+    for(long i = 0; i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             stateOfV = classical(2, (i>>(n-v-1)) & 0x1);
             stateOfV = applyOperator(stateOfV, U1);
@@ -205,22 +232,91 @@ vector<sparse_elt> CU1Expanded(vector<sparse_elt> U1, const int n, const int u, 
     }
     return CU1;
 }
+vector<sparse_elt> CPhase(const int n, const int u, const int v, double phi) {
+    return CU1Expanded(phase(phi), n, u, v);
+}
 
+vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
+    vector<sparse_elt> swp;
+    long N = pow(2, n);
+    //dimensions
+    swp.push_back(createElt(N, N, 0.0));
+    // values
+    int j;
+    for(int i = 0; i < N; ++i) {
+        if (i>>(n-u-1) ^ i>>(n-v-1)) {
+            j = i ^ (0x1<<(n-u-1)) ^ (0x1<<(n-v-1));
+            swp.push_back(createElt(i, j, 1.0));
+        } else {
+            swp.push_back(createElt(i, i, 1.0));
+        }
+    }
+    return swp;
+}
 
+/* Pi estimation functions */
+
+/* Inverse quantum fourier transform */
+vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n) {
+    const int n_prime = n+1;
+    for (int i = 0; i < n/2; ++i) {
+        state = applyOperator(state, swapExpanded(n_prime, i, n-i-1));    
+    }
+    for (int j = 0; j < n; ++j) {
+        for (int m = 0; m < j; ++m) {
+            double phi = -M_PI / ((double)pow(2, j - m));
+            state = applyOperator(state, CPhase(n_prime, m, j, phi)); 
+        }
+        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, j));
+    }
+    return state;
+}
+
+// Setup for quantum phase estimation. 
+vector<complex<double> > qpe_pre(const int n){
+    const long N = pow(2, n+1);
+    const int n_prime = n+1;
+    vector<complex<double> > state = classical(N, 0);
+    for (int i = 0; i < n; ++i) {
+        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
+    }
+    state = applyOperator(state, oneQubitGateExpand(naught(), n_prime, n));
+    
+    for (int i = n-1; i >= 0; --i) {
+        for(int j = 0; j < pow(2, n-i-1); ++j) {
+            state = applyOperator(state, CPhase(n, n-i-1, n, 1.0));
+        }
+    }
+
+    return state;
+}
+
+double get_pi_estimate(const int n) {
+    vector<complex<double> > state = qpe_pre(n);
+    state = qft_dagger(state, n);
+    long most_likely = getMostLikely(state, n+1);
+    //printVec(state, n+1, pow(2, n+1), false);
+    cout << most_likely << "\n";
+    return 1.0;
+    //return (((double)pow(2, n-1)) / (double)most_likely);
+}
 
 int main() {
-    const int n = 2;
-    const int N = pow(2, n);
-    vector<complex<double> > state = classical(N, 0);
+    const int n = 10;
+    //const int N = pow(2, n);
+
+    cout << get_pi_estimate(n) << endl;
+    /*vector<complex<double> > state = classical(N, 0);*/
+
     
     /* Uniform superposition: */
     /*for (int i = 0; i < n; ++i) {
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));    
-    }*/
+    }
+    //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
     state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
-    state = applyOperator(state, oneQubitGateExpand(naught(), n, 1));
-    state = applyOperator(state, CU1Expanded(hadamard(), n, 0, 1));
+    state = applyOperator(state, CPhase(n, 0,1, 0.1));
 
-    printVec(state, n, N, false);
+    printVec(state, n, N, false);*/
     //printVecProbs(state, n, N, false);
 }
