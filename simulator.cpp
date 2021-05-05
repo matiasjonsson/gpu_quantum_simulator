@@ -127,7 +127,6 @@ long getMostLikely(vector<complex<double> > state, int n) {
     double prob = 0.0;
     long N = pow(2, n);
     for (long i = 0; i < N; i++) {
-        cout << norm(state.data()[i]) << " ";
         if (norm(state.data()[i]) > prob) {
             prob = norm(state.data()[i]);
             ans = i;
@@ -169,14 +168,14 @@ vector<sparse_elt> hadamard() {
     return had;
 }
 vector<sparse_elt> phase(double phi){
-    vector<sparse_elt> pha;
+    vector<sparse_elt> phase;
     // dimensions
-    pha.push_back(createElt(2,2, 0.0));
+    phase.push_back(createElt(2,2, 0.0));
     // values
-    pha.push_back(createElt(0,0, 1.0));
-    complex<double> exp (cos(phi), sin(phi));
-    pha.push_back(createElt(1,1,exp));
-    return pha;
+    phase.push_back(createElt(0,0, 1.0));
+    complex<double> ex (cos(phi), sin(phi));
+    phase.push_back(createElt(1,1,ex));
+    return phase;
 }
 
 
@@ -237,6 +236,7 @@ vector<sparse_elt> CPhase(const int n, const int u, const int v, double phi) {
 }
 
 vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
+    assert(u != v);
     vector<sparse_elt> swp;
     long N = pow(2, n);
     //dimensions
@@ -244,8 +244,8 @@ vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     // values
     int j;
     for(int i = 0; i < N; ++i) {
-        if (i>>(n-u-1) ^ i>>(n-v-1)) {
-            j = i ^ (0x1<<(n-u-1)) ^ (0x1<<(n-v-1));
+        if ((i>>(n-u-1) & 0x1) ^ (i>>(n-v-1) & 0x1)) {
+            j = (i ^ (0x1<<(n-u-1))) ^ (0x1<<(n-v-1));
             swp.push_back(createElt(i, j, 1.0));
         } else {
             swp.push_back(createElt(i, i, 1.0));
@@ -254,7 +254,7 @@ vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     return swp;
 }
 
-/* Pi estimation functions */
+/* Pi estimation functions for benchmarking performance. */
 
 /* Inverse quantum fourier transform */
 vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n) {
@@ -265,7 +265,7 @@ vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n)
     for (int j = 0; j < n; ++j) {
         for (int m = 0; m < j; ++m) {
             double phi = -M_PI / ((double)pow(2, j - m));
-            state = applyOperator(state, CPhase(n_prime, m, j, phi)); 
+            state = applyOperator(state, CPhase(n_prime, j, m, phi)); 
         }
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, j));
     }
@@ -281,24 +281,32 @@ vector<complex<double> > qpe_pre(const int n){
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
     }
     state = applyOperator(state, oneQubitGateExpand(naught(), n_prime, n));
-    
+
     for (int i = n-1; i >= 0; --i) {
-        for(int j = 0; j < pow(2, n-i-1); ++j) {
-            state = applyOperator(state, CPhase(n, n-i-1, n, 1.0));
+        for (int j = 0; j < pow(2, n-i-1); ++j) {
+            state = applyOperator(state, CPhase(n_prime, n, n-i-1, 1.0));
         }
     }
-
     return state;
+}
+
+/* The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
+ * setting up the problem. Additionally, we want to read them in reverse. */
+long getCorrectBitsForPiEstimate(long bits, int n){
+    long answer = 0;
+    for(int i = 1; i <= n; i++){
+        answer = answer<<1;
+        answer += (bits>>i) & 0x1L;
+    }
+    return answer;
 }
 
 double get_pi_estimate(const int n) {
     vector<complex<double> > state = qpe_pre(n);
     state = qft_dagger(state, n);
-    long most_likely = getMostLikely(state, n+1);
-    //printVec(state, n+1, pow(2, n+1), false);
-    cout << most_likely << "\n";
-    return 1.0;
-    //return (((double)pow(2, n-1)) / (double)most_likely);
+    long mostLikely = getMostLikely(state, n+1);
+    double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0,n);
+    return 1.0 / (2 * theta);
 }
 
 int main() {
@@ -306,6 +314,10 @@ int main() {
     //const int N = pow(2, n);
 
     cout << get_pi_estimate(n) << endl;
+    
+    
+    
+    //Testing functions out
     /*vector<complex<double> > state = classical(N, 0);*/
 
     
