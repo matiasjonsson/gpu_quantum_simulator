@@ -1,8 +1,9 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <thrust/complex.h>
+#include <complex>
 
-
-using namespace std; 
+using namespace std;
 
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
@@ -12,44 +13,100 @@ struct sparse_elt {
     complex<double> amp;
 };
 
-sparse_elt createElt(int u, int v, complex<double> amp) {
-    sparse_elt elt;
+typedef enum GateName{
+    HADAMARD,
+    IDENTITY,
+    CNOT,
+    NOT,
+    CU11,
+    SWAP
+    // Add more gates as necessary
+} GateName;
+
+
+struct gate {
+    GateName name;
+    vector<int> operands;
+};
+
+
+struct my_complex_norm {
+    template <typename T>
+    __host__ __device__
+    T operator()(thrust::complex<T> &d){
+         return thrust::norm(d);
+    }
+};
+
+class increment
+{
+    private:
+            int num;
+    public:
+            increment(int n) : num(n) {  }
+
+                    // This operator overloading enables calling
+                    // operator function () on objects of increment
+            int operator () (int arr_num) const {
+                return num + arr_num;
+            }
+};
+
+
+__global__
+void createElt(int u, int v, complex<double> amp, sparse_elt &elt) {
     elt.u = u;
     elt.v = v;
     elt.amp = amp;
-    return elt;
 }
+
 
 bool equalsZero(complex<double> amplitude) {
     return (norm(amplitude) < 1e-15);
 }
-
-bool isNormalized (thrust::vector<complex<double> > state) {
+/*
+//__global__
+bool isNormalized (thrust::device_vector<complex<double> > state) {
     double sum = 0;
     for (auto i = state.begin(); i != state.end(); ++i) {
         sum += norm(*i);
     }
     return (abs(1.0 - sum) < 1e-15);
+}*/
+
+//TODO FIX Norm
+bool isNormalized (thrust::device_vector<complex<double> > state) {
+    double sum = 0;
+    thrust::device_vector<double> out (state.size());
+
+    thrust::transform(state.begin(), state.end(), out.begin(), my_complex_norm());
+
+    //for (int i = 0; i < state.size(); i++) sum += my_complex_norm(state[i]);
+
+    return (abs(1.0 - sum) < 1e-15);
 }
 
-thrust::vector<complex<double> > uniform(const long N) {
-    thrust::vector<complex<double> > state;
-    state.assign(N, sqrt(1.0/N));
-    return state;
+
+__global__
+void uniform(thrust::device_vector<complex<double> > &state, const long N) {
+
+    thrust::fill(state.begin(), state.end(), sqrt(1.0/N));
 }
-thrust::vector<complex<double> > zero(const long N) {
-    thrust::vector<complex<double> > state;
-    state.assign(N, 0);
-    return state;
+
+__global__
+void zero(thrust::device_vector<complex<double> > state,  const long N) {
+    thrust::fill(state.begin(), state.end(), 0);
 }
-thrust::vector<complex<double> > classical(const long N, const int init) {
-    thrust::vector<complex<double> > state = zero(N);
+
+__global__
+void classical(thrust::device_vector<complex<double> > state, const long N, const int init) {
+    thrust::fill(state.begin(), state.end(), 0);
     state.data()[init] = 1.0;
-    return state;
 }
 
-thrust::vector<complex<double> > applyOperator(thrust::vector<complex<double> > state, thrust::vector<sparse_elt> unitary) {
-    assert(unitary.begin()->u == state.size());
+//__global__
+thrust::device_vector<complex<double> > applyOperator(thrust::device_vector<complex<double> > state, thrust::device_vector<sparse_elt> unitary) {
+    //assert(unitary.begin()->u == state.size());
     thrust::vector<complex<double> > newstate = zero(state.size());
     for(auto i = unitary.begin() + 1; i != unitary.end(); ++i) {
         newstate.data()[i->u] += i->amp * state.data()[i->v];
@@ -57,10 +114,11 @@ thrust::vector<complex<double> > applyOperator(thrust::vector<complex<double> > 
     return newstate;
 }
 
-thrust::vector<sparse_elt> tensor(thrust::vector<sparse_elt> u1, thrust::vector<sparse_elt> u2) {
+//__global__
+thrust::device_vector<sparse_elt> tensor(thrust::device_vector<sparse_elt> u1, thrust::device_vector<sparse_elt> u2) {
     int dim1 = u1.begin()->u;
     int dim2 = u2.begin()->u;
-    thrust::vector<sparse_elt> u3;
+    thrust::device_vector<sparse_elt> u3;
     u3.push_back(createElt(dim1*dim2, dim1*dim2, 0.0));
     for(auto i = u1.begin() + 1; i != u1.end(); ++i) {
         for(auto j = u2.begin() + 1; j != u2.end(); ++j) {
@@ -72,10 +130,13 @@ thrust::vector<sparse_elt> tensor(thrust::vector<sparse_elt> u1, thrust::vector<
 
 /* Print features */
 
+__global__
 void printComplex(complex<double> amplitude) {
     cout << "(" << real(amplitude) << "+" << imag(amplitude) << "i)";
 }
-void printVec(thrust::vector<complex<double> > state, const int n, const long N, bool printAll) {
+
+__global__
+void printVec(thrust::host_vector<complex<double> > state, const int n, const long N, bool printAll) {
     cout << "State:\n";
     for (int i = 0; i < N; ++i) {
         if (!printAll && equalsZero(state.at(i)))
@@ -89,7 +150,9 @@ void printVec(thrust::vector<complex<double> > state, const int n, const long N,
         cout << "\n";
     }
 }
-void printVecProbs(thrust::vector<complex<double> > state, const int n, const long N, bool printAll) {
+
+__global__
+void printVecProbs(thrust::host_vector<complex<double> > state, const int n, const long N, bool printAll) {
     cout << "Probability distribution:\n";
     for (int i = 0; i < N; ++i) {
         if (!printAll && equalsZero(state.at(i)))
@@ -103,7 +166,9 @@ void printVecProbs(thrust::vector<complex<double> > state, const int n, const lo
     }
 }
 
-void printOp(thrust::vector<sparse_elt> U) {
+
+__global__
+void printOp(thrust::host_vector<sparse_elt> U) {
     thrust::vector<thrust::vector<complex<double> > > densified;
     int dim = U.begin()->u;
     densified.assign(dim, zero(dim));
@@ -118,7 +183,9 @@ void printOp(thrust::vector<sparse_elt> U) {
     }
 }
 
-long getMostLikely(thrust::vector<complex<double> > state, int n) {
+
+__global__
+long getMostLikely(thrust::device_vector<complex<double> > state, int n) {
     long ans = -1;
     double prob = 0.0;
     long N = pow(2, n);
@@ -131,8 +198,10 @@ long getMostLikely(thrust::vector<complex<double> > state, int n) {
     return ans;
 }
 
-/* One qubit gates */ 
-thrust::vector<sparse_elt> identity(){
+
+/* One qubit gates */
+__global__
+thrust::device_vector<sparse_elt> identity(){
     thrust::vector<sparse_elt> id;
     // dimensions
     id.push_back(createElt(2, 2, 0.0));
@@ -142,7 +211,8 @@ thrust::vector<sparse_elt> identity(){
     return id;
 }
 
-thrust::vector<sparse_elt> naught() {
+__global__
+thrust::device_vector<sparse_elt> naught() {
     thrust::vector<sparse_elt> naught;
     // dimensions
     naught.push_back(createElt(2, 2, 0.0));
@@ -151,7 +221,9 @@ thrust::vector<sparse_elt> naught() {
     naught.push_back(createElt(0, 1, 1.0));
     return naught;
 }
-thrust::vector<sparse_elt> hadamard() {
+
+__global__
+thrust::device_vector<sparse_elt> hadamard() {
     thrust::vector<sparse_elt> had;
     // dimensions
     had.push_back(createElt(2, 2, 0.0));
@@ -163,7 +235,9 @@ thrust::vector<sparse_elt> hadamard() {
     had.push_back(createElt(1, 1, -norm));
     return had;
 }
-thrust::vector<sparse_elt> phase(double phi){
+
+__global__
+thrust::device_vector<sparse_elt> phase(double phi){
     thrust::vector<sparse_elt> phase;
     // dimensions
     phase.push_back(createElt(2,2, 0.0));
@@ -178,10 +252,11 @@ thrust::vector<sparse_elt> phase(double phi){
 /* Expanding operations for 1 qubit gates. */
 
 /* It is much more efficient to do many 1 qubit gates sequentially than to compute their tensor product */
-thrust::vector<sparse_elt> oneQubitGateExpand(thrust::vector<sparse_elt> oneQubitGate, const int n, const int which) {
+__global__
+thrust::device_vector<sparse_elt> oneQubitGateExpand(thrust::device_vector<sparse_elt> oneQubitGate, const int n, const int which) {
     thrust::vector<sparse_elt> total = (which == 0 ? oneQubitGate : identity());
     for(int i = 1; i < n; ++i) {
-        if(which == i) 
+        if(which == i)
             total = tensor(total, oneQubitGate);
         else
             total = tensor(total, identity());
@@ -191,7 +266,8 @@ thrust::vector<sparse_elt> oneQubitGateExpand(thrust::vector<sparse_elt> oneQubi
 
 
 /* Two qubit gates */
-thrust::vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) { 
+__global__
+thrust::device_vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) {
     thrust::vector<sparse_elt> cnot;
     long N = pow(2, n);
     cnot.push_back(createElt(N, N, 0.0));
@@ -206,11 +282,12 @@ thrust::vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) {
     }
     return cnot;
 }
-thrust::vector<sparse_elt> CU1Expanded(thrust::vector<sparse_elt> U1, const int n, const int u, const int v) {
-    thrust::vector<sparse_elt> CU1;
+__global__
+thrust::device_vector<sparse_elt> CU1Expanded(thrust::device_vector<sparse_elt> U1, const int n, const int u, const int v) {
+    thrust::device_vector<sparse_elt> CU1;
     long N = pow(2, n);
     CU1.push_back(createElt(N, N, 0.0));
-    thrust::vector<complex<double> > stateOfV;
+    thrust::device_vector<complex<double> > stateOfV;
     for(long i = 0; i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             stateOfV = classical(2, (i>>(n-v-1)) & 0x1);
@@ -227,10 +304,13 @@ thrust::vector<sparse_elt> CU1Expanded(thrust::vector<sparse_elt> U1, const int 
     }
     return CU1;
 }
+__global__
 thrust::vector<sparse_elt> CPhase(const int n, const int u, const int v, double phi) {
     return CU1Expanded(phase(phi), n, u, v);
 }
 
+
+__global__
 thrust::vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     assert(u != v);
     thrust::vector<sparse_elt> swp;
@@ -253,28 +333,31 @@ thrust::vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
 /* Pi estimation functions for benchmarking performance. */
 
 /* Inverse quantum fourier transform */
+
+__global__
 thrust::vector<complex<double> > qft_dagger(thrust::vector<complex<double> > state, const int n) {
     const int n_prime = n+1;
     for (int i = 0; i < n/2; ++i) {
-        state = applyOperator(state, swapExpanded(n_prime, i, n-i-1));    
+        state = applyOperator(state, swapExpanded(n_prime, i, n-i-1));
     }
     for (int j = 0; j < n; ++j) {
         for (int m = 0; m < j; ++m) {
             double phi = -M_PI / ((double)pow(2, j - m));
-            state = applyOperator(state, CPhase(n_prime, j, m, phi)); 
+            state = applyOperator(state, CPhase(n_prime, j, m, phi));
         }
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, j));
     }
     return state;
 }
 
-// Setup for quantum phase estimation. 
+// Setup for quantum phase estimation.
+__global__
 thrust::vector<complex<double> > qpe_pre(const int n){
     const long N = pow(2, n+1);
     const int n_prime = n+1;
     thrust::vector<complex<double> > state = classical(N, 0);
     for (int i = 0; i < n; ++i) {
-        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
+        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));
     }
     state = applyOperator(state, oneQubitGateExpand(naught(), n_prime, n));
 
@@ -288,6 +371,8 @@ thrust::vector<complex<double> > qpe_pre(const int n){
 
 /* The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
  * setting up the problem. Additionally, we want to read them in reverse. */
+
+__global__
 long getCorrectBitsForPiEstimate(long bits, int n){
     long answer = 0;
     for(int i = 1; i <= n; i++){
@@ -297,6 +382,7 @@ long getCorrectBitsForPiEstimate(long bits, int n){
     return answer;
 }
 
+__global__
 double get_pi_estimate(const int n) {
     thrust::vector<complex<double> > state = qpe_pre(n);
     state = qft_dagger(state, n);
@@ -310,16 +396,16 @@ int main() {
     //const int N = pow(2, n);
 
     cout << get_pi_estimate(n) << endl;
-    
-    
-    
+
+
+
     //Testing functions out
     /*vector<complex<double> > state = classical(N, 0);*/
 
-    
+
     /* Uniform superposition: */
     /*for (int i = 0; i < n; ++i) {
-        state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));    
+        state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));
     }
     //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
     state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
