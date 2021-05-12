@@ -18,8 +18,15 @@ struct sparse_elt {
     cuDoubleComplex amp;
 };
 
+sparse_elt createEltHost(int u, int v, cuDoubleComplex amp) {
+    sparse_elt elt;
+    elt.u = u;
+    elt.v = v;
+    elt.amp = amp;
+    return elt;
+}
 __device__ sparse_elt
-createElt(int u, int v, cuDoubleComplex amp) {
+createEltDevice(int u, int v, cuDoubleComplex amp) {
     sparse_elt elt;
     elt.u = u;
     elt.v = v;
@@ -145,39 +152,8 @@ cuDoubleComplex* classical(const long N, const long which, const int blocks, con
     return state;
 }
 
-__device__ void
-atomicComplexAdd(cuDoubleComplex* ptr, cuDoubleComplex valToAdd) {
-    double2 *newPtr = (double2*) ptr;
-    double2 newVal = (double2) valToAdd;
-    atomicAdd(&(newPtr->x), newVal.x);
-    atomicAdd(&(newPtr->y), newVal.y);
-}
 
-__global__ void
-applyOperator(cuDoubleComplex* state, cuDoubleComplex* newstate, const long N, sparse_elt* unitary, const int blocks, const int threadsPerBlock) {
-    __shared__ long sizeOfSparse;
-    sizeOfSparse = unitary[0].u;
-    int id = blockIdx.x * blockDim.x + threadIdx.x;
-    int numPerThread = max(sizeOfSparse / (blockDim.x * gridDim.x), 1L);
-    for(long i = (id * numPerThread) + 1; i < ((id + 1) * numPerThread) + 1 && i < sizeOfSparse; ++i) {
-        atomicComplexAdd(&newstate[unitary[i].u], cuCmul(unitary[i].amp, state[unitary[i].v]));
-    }
-}
-/*
-vector<sparse_elt> tensor(vector<sparse_elt> u1, vector<sparse_elt> u2) {
-    int dim1 = u1.begin()->u;
-    int dim2 = u2.begin()->u;
-    vector<sparse_elt> u3;
-    u3.push_back(createElt(dim1*dim2, dim1*dim2, 0.0));
-    for(auto i = u1.begin() + 1; i != u1.end(); ++i) {
-        for(auto j = u2.begin() + 1; j != u2.end(); ++j) {
-            u3.push_back(createElt(i->u * dim2 + j->u, i->v * dim2 + j->v, i->amp * j->amp));
-        }
-    }
-    return u3;
-}
-*/
-/* Print features */
+/* Print vector features */
 
 void printComplex(cuDoubleComplex amplitude) {
     cout << "(" << cuCreal(amplitude) << "+" << cuCimag(amplitude) << "i)";
@@ -215,21 +191,7 @@ void printVecProbs(cuDoubleComplex* state, const int n, const long N, bool print
     }
     free(stateHost);
 }
-/*
-void printOp(vector<sparse_elt> U) {
-    vector<vector<complex<double> > > densified;
-    int dim = U.begin()->u;
-    densified.assign(dim, zero(dim));
-    for (auto x = U.begin()+1; x != U.end(); ++x) {
-        densified.data()[x->u].data()[x->v] += x->amp;
-    }
-    for (int x = 0; x < dim; ++x) {
-        for (int y = 0; y < dim; ++y) {
-            cout << densified.data()[x].data()[y] << " ";
-        }
-        cout << "\n";
-    }
-}*/
+
 
 __global__ void
 getMostLikely(cuDoubleComplex* state, unsigned long long int* temp, const int n, const long N, unsigned long long int *ans) {
@@ -252,39 +214,51 @@ getMostLikely(cuDoubleComplex* state, unsigned long long int* temp, const int n,
     }
 }
 
+
 /* One qubit gates */ 
-/*
-vector<sparse_elt> identity(){
-    vector<sparse_elt> id;
+
+sparse_elt* identity(){
+    sparse_elt* idDevice;
+    cudaMalloc((void**)&idDevice, 3 * sizeof(sparse_elt));
     // dimensions
-    id.push_back(createElt(2, 2, 0.0));
+    sparse_elt idHost[3];
+    idHost[0] = createEltHost(3, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    id.push_back(createElt(0, 0, 1.0));
-    id.push_back(createElt(1, 1, 1.0));
-    return id;
+    idHost[1] = createEltHost(0, 0, make_cuDoubleComplex(1.0, 0.0));
+    idHost[2] = createEltHost(1, 1, make_cuDoubleComplex(1.0, 0.0));
+    cudaMemcpy(idDevice, &idHost, 3 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
+    return idDevice;
 }
 
-vector<sparse_elt> naught() {
-    vector<sparse_elt> naught;
+sparse_elt* naught() {
+    sparse_elt* cxDevice;
+    cudaMalloc((void**)&cxDevice, 3 * sizeof(sparse_elt));
+    sparse_elt cxHost[3];
     // dimensions
-    naught.push_back(createElt(2, 2, 0.0));
+    cxHost[0] = createEltHost(3, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    naught.push_back(createElt(1, 0, 1.0));
-    naught.push_back(createElt(0, 1, 1.0));
-    return naught;
+    cxHost[1] = createEltHost(1, 0, make_cuDoubleComplex(1.0, 0.0));
+    cxHost[2] = createEltHost(0, 1, make_cuDoubleComplex(1.0, 0.0));
+    cudaMemcpy(cxDevice, &cxHost, 3 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
+    return cxDevice;
 }
-vector<sparse_elt> hadamard() {
-    vector<sparse_elt> had;
+
+sparse_elt* hadamard() {
+    sparse_elt* hadDevice;
+    cudaMalloc((void**)&hadDevice, 5 * sizeof(sparse_elt));
+    sparse_elt hadHost[5];
     // dimensions
-    had.push_back(createElt(2, 2, 0.0));
+    hadHost[0] = createEltHost(5, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
     double norm = 1.0 / sqrt(2);
-    had.push_back(createElt(0, 0, norm));
-    had.push_back(createElt(0, 1, norm));
-    had.push_back(createElt(1, 0, norm));
-    had.push_back(createElt(1, 1, -norm));
-    return had;
+    hadHost[1] = createEltHost(0, 0, make_cuDoubleComplex(norm, 0.0));
+    hadHost[2] = createEltHost(0, 1, make_cuDoubleComplex(norm, 0.0));
+    hadHost[3] = createEltHost(1, 0, make_cuDoubleComplex(norm, 0.0));
+    hadHost[4] = createEltHost(1, 1, make_cuDoubleComplex(-norm, 0.0));
+    cudaMemcpy(hadDevice, &hadHost, 5 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
+    return hadDevice;
 }
+/*
 vector<sparse_elt> phase(double phi){
     vector<sparse_elt> phase;
     // dimensions
@@ -374,6 +348,66 @@ vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     return swp;
 }
 */
+
+__device__ void
+atomicComplexAdd(cuDoubleComplex* ptr, cuDoubleComplex valToAdd) {
+    double2 *newPtr = (double2*) ptr;
+    double2 newVal = (double2) valToAdd;
+    atomicAdd(&(newPtr->x), newVal.x);
+    atomicAdd(&(newPtr->y), newVal.y);
+}
+
+__global__ void
+applyOperator(cuDoubleComplex* state, cuDoubleComplex* newstate, const long N, sparse_elt* unitary) {
+    __shared__ long sizeOfSparse;
+    sizeOfSparse = unitary[0].u;
+    assert(unitary[0].v == N);
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(sizeOfSparse / (blockDim.x * gridDim.x), 1L);
+    for(long i = (id * numPerThread) + 1; i < ((id + 1) * numPerThread) + 1 && i < sizeOfSparse; ++i) {
+        atomicComplexAdd(&newstate[unitary[i].u], cuCmul(unitary[i].amp, state[unitary[i].v]));
+    }
+}
+/* Call swapPtrs after every applyOperator. */
+void swapPtrs(cuDoubleComplex** state, cuDoubleComplex** newState, const int N, const int blocks, const int threadsPerBlock) {
+    cuDoubleComplex* temp = *state;
+    *state = *newState;
+    *newState = temp;
+    assignAll<<<blocks, threadsPerBlock>>>(*newState, N, make_cuDoubleComplex(0.0,0.0));
+}
+
+/*
+vector<sparse_elt> tensor(vector<sparse_elt> u1, vector<sparse_elt> u2) {
+    int dim1 = u1.begin()->u;
+    int dim2 = u2.begin()->u;
+    vector<sparse_elt> u3;
+    u3.push_back(createElt(dim1*dim2, dim1*dim2, 0.0));
+    for(auto i = u1.begin() + 1; i != u1.end(); ++i) {
+        for(auto j = u2.begin() + 1; j != u2.end(); ++j) {
+            u3.push_back(createElt(i->u * dim2 + j->u, i->v * dim2 + j->v, i->amp * j->amp));
+        }
+    }
+    return u3;
+}
+*/
+
+/*
+void printOp(vector<sparse_elt> U) {
+    vector<vector<complex<double> > > densified;
+    int dim = U.begin()->u;
+    densified.assign(dim, zero(dim));
+    for (auto x = U.begin()+1; x != U.end(); ++x) {
+        densified.data()[x->u].data()[x->v] += x->amp;
+    }
+    for (int x = 0; x < dim; ++x) {
+        for (int y = 0; y < dim; ++y) {
+            cout << densified.data()[x].data()[y] << " ";
+        }
+        cout << "\n";
+    }
+}*/
+
+
 /* Pi estimation functions for benchmarking performance. */
 
 /* Inverse quantum fourier transform */
@@ -394,8 +428,9 @@ vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n)
 }*/
 
 // Setup for quantum phase estimation. 
-cuDoubleComplex* qpe_pre(const int n, const long N, const int blocks, const int threadsPerBlock){
+cuDoubleComplex* qpe_pre(const int n, const int blocks, const int threadsPerBlock){
     const int n_prime = n+1;
+    const long N = pow(2, n_prime);
     cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
     /*for (int i = 0; i < n; ++i) {
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
@@ -423,10 +458,15 @@ long getCorrectBitsForPiEstimate(long bits, int n){
 
 int get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
     //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
-    //cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
-    cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
-
-    
+    cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
+    cuDoubleComplex* newState = zero(N, blocks, threadsPerBlock);
+    //cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
+    cudaDeviceSynchronize();
+    sparse_elt* id = identity();
+    sparse_elt* cx = naught();
+    sparse_elt* had = hadamard();
+    applyOperator<<<blocks, threadsPerBlock>>>(state, newState, N, had); 
+    swapPtrs(&state, &newState, N, blocks, threadsPerBlock);
     
     printVec(state, n, N, false);
     //printVecProbs(state, n, N, false);
@@ -440,12 +480,16 @@ int get_pi_estimate(const int n, const int N, const int blocks, const int thread
     //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
     state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
     state = applyOperator(state, CPhase(n, 0,1, 0.1));*/
+    cudaFree(id);
+    cudaFree(cx);
+    cudaFree(had);
     cudaFree(state);
+    cudaFree(newState);
     return 0;
 }
 
 int main(){
-    int n = 4;
+    int n = 1;
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
