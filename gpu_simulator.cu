@@ -2,7 +2,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/complex.h>
 #include <complex>
-
+#include <cusparse.h>
 using namespace std;
 
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
@@ -72,7 +72,7 @@ bool isNormalized (thrust::device_vector<complex<double> > state) {
         sum += norm(*i);
     }
     return (abs(1.0 - sum) < 1e-15);
-}*/
+//}
 
 //TODO FIX Norm
 bool isNormalized (thrust::device_vector<complex<double> > state) {
@@ -81,6 +81,11 @@ bool isNormalized (thrust::device_vector<complex<double> > state) {
 
     thrust::transform(state.begin(), state.end(), out.begin(), my_complex_norm());
 
+    thrust::counting_iterator<int> first(0);
+
+    thrust::counting_iterator<int> last = first + state.size();
+
+    thrust::reduce(first, last);
     //for (int i = 0; i < state.size(); i++) sum += my_complex_norm(state[i]);
 
     return (abs(1.0 - sum) < 1e-15);
@@ -89,7 +94,7 @@ bool isNormalized (thrust::device_vector<complex<double> > state) {
 
 __global__
 void uniform(thrust::device_vector<complex<double> > &state, const long N) {
-
+    thrust::reduce(first, last)
     thrust::fill(state.begin(), state.end(), sqrt(1.0/N));
 }
 
@@ -107,7 +112,7 @@ void classical(thrust::device_vector<complex<double> > state, const long N, cons
 //__global__
 thrust::device_vector<complex<double> > applyOperator(thrust::device_vector<complex<double> > state, thrust::device_vector<sparse_elt> unitary) {
     //assert(unitary.begin()->u == state.size());
-    thrust::vector<complex<double> > newstate = zero(state.size());
+    thrust::device_vector<complex<double> > newstate = zero(state.size());
     for(auto i = unitary.begin() + 1; i != unitary.end(); ++i) {
         newstate.data()[i->u] += i->amp * state.data()[i->v];
     }
@@ -128,7 +133,7 @@ thrust::device_vector<sparse_elt> tensor(thrust::device_vector<sparse_elt> u1, t
     return u3;
 }
 
-/* Print features */
+// Print features
 
 __global__
 void printComplex(complex<double> amplitude) {
@@ -199,7 +204,7 @@ long getMostLikely(thrust::device_vector<complex<double> > state, int n) {
 }
 
 
-/* One qubit gates */
+// One qubit gates
 __global__
 thrust::device_vector<sparse_elt> identity(){
     thrust::vector<sparse_elt> id;
@@ -249,9 +254,9 @@ thrust::device_vector<sparse_elt> phase(double phi){
 }
 
 
-/* Expanding operations for 1 qubit gates. */
+// Expanding operations for 1 qubit gates.
 
-/* It is much more efficient to do many 1 qubit gates sequentially than to compute their tensor product */
+// It is much more efficient to do many 1 qubit gates sequentially than to compute their tensor product
 __global__
 thrust::device_vector<sparse_elt> oneQubitGateExpand(thrust::device_vector<sparse_elt> oneQubitGate, const int n, const int which) {
     thrust::vector<sparse_elt> total = (which == 0 ? oneQubitGate : identity());
@@ -265,7 +270,8 @@ thrust::device_vector<sparse_elt> oneQubitGateExpand(thrust::device_vector<spars
 }
 
 
-/* Two qubit gates */
+// Two qubit gates
+
 __global__
 thrust::device_vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) {
     thrust::vector<sparse_elt> cnot;
@@ -330,9 +336,9 @@ thrust::vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     return swp;
 }
 
-/* Pi estimation functions for benchmarking performance. */
+// Pi estimation functions for benchmarking performance.
 
-/* Inverse quantum fourier transform */
+// Inverse quantum fourier transform
 
 __global__
 thrust::vector<complex<double> > qft_dagger(thrust::vector<complex<double> > state, const int n) {
@@ -369,8 +375,8 @@ thrust::vector<complex<double> > qpe_pre(const int n){
     return state;
 }
 
-/* The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
- * setting up the problem. Additionally, we want to read them in reverse. */
+// The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
+// setting up the problem. Additionally, we want to read them in reverse.
 
 __global__
 long getCorrectBitsForPiEstimate(long bits, int n){
@@ -400,18 +406,18 @@ int main() {
 
 
     //Testing functions out
-    /*vector<complex<double> > state = classical(N, 0);*/
+    vector<complex<double> > state = classical(N, 0);
 
 
-    /* Uniform superposition: */
-    /*for (int i = 0; i < n; ++i) {
+    // Uniform superposition:
+    for (int i = 0; i < n; ++i) {
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));
     }
     //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
     state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
     state = applyOperator(state, CPhase(n, 0,1, 0.1));
 
-    printVec(state, n, N, false);*/
+    printVec(state, n, N, false);
     //printVecProbs(state, n, N, false);
 }
 
@@ -422,11 +428,35 @@ double get_pi_estimate(const int n) {
     double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0,n);
     return 1.0 / (2 * theta);
 }
+*/
 
-
-
-int main{
+int main(){
     printf("Trying something anything");
+
+
+    cudaStat1 = cudaMalloc((void**)&z, 2*(n+1)*sizeof(z[0]));
+    if (cudaStat1 != cudaSuccess) {
+            CLEANUP("Device malloc failed (z)");
+                return 1;
+    }
+    cudaStat1 = cudaMemset((void *)z,0, 2*(n+1)*sizeof(z[0]));
+    if (cudaStat1 != cudaSuccess) {
+            CLEANUP("Memset on Device failed");
+                return 1;
+    }
+    status= cusparseDcsrmm(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, n, 2, n,
+                                   nnz, &dfive, descr, cooVal, csrRowPtr, cooColIndex,
+                                                          y, n, &dzero, z, n+1);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+            CLEANUP("Matrix-matrix multiplication failed");
+                return 1;
+    }
+
+
+
+
+
+
 
     return 0;
 }
