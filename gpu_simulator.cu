@@ -47,7 +47,7 @@ bool equalsZeroHost(cuDoubleComplex amplitude) {
 
 
 __global__ void
-assignAll(cuDoubleComplex *vec, long N, cuDoubleComplex val) {
+assignAll(cuDoubleComplex *vec, const long N, cuDoubleComplex val) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     for(int i = id * numPerThread; i < ((id + 1) * numPerThread) && i < N; ++i) {
@@ -56,7 +56,7 @@ assignAll(cuDoubleComplex *vec, long N, cuDoubleComplex val) {
 }
 
 __device__ void
-assignAllDoublesDevice(double *vec, long N, double val) {
+assignAllDoublesDevice(double *vec, const long N, double val) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     for(int i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; ++i) {
@@ -65,19 +65,37 @@ assignAllDoublesDevice(double *vec, long N, double val) {
 }
 
 __global__ void
-assignOne(cuDoubleComplex *vec, long N, cuDoubleComplex val, long which) {
+assignOne(cuDoubleComplex *vec, const long N, cuDoubleComplex val, const long which) {
     if(blockIdx.x == 0 && threadIdx.x == 0) {
         vec[which] = val;
     }
 }
 
+/* These reduction helpers require that vec is of length blockDim * gridDim. */
 __device__ void
 sumReductionHelper(int id, double *vec, double *ans){
-    atomicAdd(ans, vec[id]);
+    __shared__ double sum;
+    sum = 0.0;
+    atomicAdd(&sum, vec[id]);
+    __syncthreads();
+    if(threadIdx.x == 0) {
+        atomicAdd(ans, sum);
+    }
+}
+__device__ void
+maxReductionHelper(int id, unsigned long long int *vec, unsigned long long int *ans){
+    __shared__ unsigned long long int max;
+    max = 0;
+    atomicMax(&max, vec[id]);
+    __syncthreads();
+    if(threadIdx.x == 0) {
+        atomicMax(ans, max);
+    }
 }
 
+
 __global__ void
-totalMag (cuDoubleComplex *state, long N, double *temp, double *ans) {
+totalMag (cuDoubleComplex *state, const long N, double *temp, double *ans) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     assignAllDoublesDevice(temp, blockDim.x * gridDim.x, 0.0);
@@ -88,10 +106,12 @@ totalMag (cuDoubleComplex *state, long N, double *temp, double *ans) {
 
     temp[id] = sum;
     __syncthreads();
-    sumReductionHelper(id, temp, ans);
+    if(id < N) {
+        sumReductionHelper(id, temp, ans);
+    }
 }
 
-double isNormalized(cuDoubleComplex *state, const long N, int blocks, int threadsPerBlock) {
+double isNormalized(cuDoubleComplex *state, const long N, const int blocks, const int threadsPerBlock) {
     double* temp;
     double* ansDevice;
     cudaMalloc((void **)&temp, sizeof(double) * blocks * threadsPerBlock);
@@ -104,45 +124,46 @@ double isNormalized(cuDoubleComplex *state, const long N, int blocks, int thread
     return ansHost;//(abs(ansHost - 1.0) < 1e-13);
 }
 
-cuDoubleComplex* uniform(const long N, int blocks, int threadsPerBlock) {
+cuDoubleComplex* uniform(const long N, const int blocks, const int threadsPerBlock) {
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignAll<<<blocks, threadsPerBlock>>> (state, N, make_cuDoubleComplex(sqrt(1.0/N),0.0));
     
     return state;
 }
-cuDoubleComplex* zero(const long N, int blocks, int threadsPerBlock) {
+cuDoubleComplex* zero(const long N, const int blocks, const int threadsPerBlock) {
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignAll<<<blocks, threadsPerBlock>>>(state, N, make_cuDoubleComplex(0.0, 0.0));
     return state;
 }
 
-cuDoubleComplex* classical(const long N, int which, int blocks, int threadsPerBlock){
+cuDoubleComplex* classical(const long N, const long which, const int blocks, const int threadsPerBlock){
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignOne<<<blocks, threadsPerBlock>>>(state, N, make_cuDoubleComplex(1.0, 0.0), which);
     return state;
 }
+
+__device__ void
+atomicComplexAdd(cuDoubleComplex* ptr, cuDoubleComplex valToAdd) {
+    double2 *newPtr = (double2*) ptr;
+    double2 newVal = (double2) valToAdd;
+    atomicAdd(&(newPtr->x), newVal.x);
+    atomicAdd(&(newPtr->y), newVal.y);
+}
+
+__global__ void
+applyOperator(cuDoubleComplex* state, cuDoubleComplex* newstate, const long N, sparse_elt* unitary, const int blocks, const int threadsPerBlock) {
+    __shared__ long sizeOfSparse;
+    sizeOfSparse = unitary[0].u;
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(sizeOfSparse / (blockDim.x * gridDim.x), 1L);
+    for(long i = (id * numPerThread) + 1; i < ((id + 1) * numPerThread) + 1 && i < sizeOfSparse; ++i) {
+        atomicComplexAdd(&newstate[unitary[i].u], cuCmul(unitary[i].amp, state[unitary[i].v]));
+    }
+}
 /*
-cuDoublecomplex* applyOperator(vector<complex<double> > state, vector<sparse_elt> unitary) {
-    //assert(unitary.begin()->u == state.size());
-    vector<complex<double> > newstate = zero(state.size());
-    for(auto i = unitary.begin() + 1; i != unitary.end(); ++i) {
-        newstate.data()[i->u] += i->amp * state.data()[i->v];
-    }
-    return newstate;
-}
-
-vector<complex<double> > applyOperator(vector<complex<double> > state, vector<sparse_elt> unitary) {
-    assert(unitary.begin()->u == state.size());
-    vector<complex<double> > newstate = zero(state.size());
-    for(auto i = unitary.begin() + 1; i != unitary.end(); ++i) {
-        newstate.data()[i->u] += i->amp * state.data()[i->v];
-    }
-    return newstate;
-}
-
 vector<sparse_elt> tensor(vector<sparse_elt> u1, vector<sparse_elt> u2) {
     int dim1 = u1.begin()->u;
     int dim2 = u2.begin()->u;
@@ -208,20 +229,28 @@ void printOp(vector<sparse_elt> U) {
         }
         cout << "\n";
     }
-}
+}*/
 
-long getMostLikely(vector<complex<double> > state, int n) {
-    long ans = -1;
+__global__ void
+getMostLikely(cuDoubleComplex* state, unsigned long long int* temp, const int n, const long N, unsigned long long int *ans) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
+    if(id == 0) {
+        *ans = 0;
+    }
     double prob = 0.0;
-    long N = pow(2, n);
-    for (long i = 0; i < N; i++) {
-        if (norm(state.data()[i]) > prob) {
-            prob = norm(state.data()[i]);
-            ans = i;
+
+    for (long i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; i++) {
+        if (norm(state[i]) > prob) {
+            prob = norm(state[i]);
+            temp[id] = i;
         }
     }
-    return ans;
-}*/
+    __syncthreads();
+    if(id < N) {
+        maxReductionHelper(id, temp, ans);
+    }
+}
 
 /* One qubit gates */ 
 /*
@@ -362,14 +391,13 @@ vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n)
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, j));
     }
     return state;
-}
+}*/
 
 // Setup for quantum phase estimation. 
-cuDoubleComplex* qpe_pre(const int n){
-    const long N = pow(2, n+1);
+cuDoubleComplex* qpe_pre(const int n, const long N, const int blocks, const int threadsPerBlock){
     const int n_prime = n+1;
-    cuDoubleComplex* state = classical(N, 0);
-    for (int i = 0; i < n; ++i) {
+    cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
+    /*for (int i = 0; i < n; ++i) {
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
     }
     state = applyOperator(state, oneQubitGateExpand(naught(), n_prime, n));
@@ -378,9 +406,10 @@ cuDoubleComplex* qpe_pre(const int n){
         for (int j = 0; j < pow(2, n-i-1); ++j) {
             state = applyOperator(state, CPhase(n_prime, n, n-i-1, 1.0));
         }
-    }
+    }*/
     return state;
-}*/
+}
+
 /* The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
  * setting up the problem. Additionally, we want to read them in reverse. */
 long getCorrectBitsForPiEstimate(long bits, int n){
@@ -392,40 +421,33 @@ long getCorrectBitsForPiEstimate(long bits, int n){
     return answer;
 }
 
-int get_pi_estimate(const int n, const int N, int blocks, int threadsPerBlock){
+int get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
     //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
-    cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
+    //cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
+    cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
+
+    
+    
+    printVec(state, n, N, false);
+    //printVecProbs(state, n, N, false);
+    
+    
     cout << isNormalized(state, N, blocks, threadsPerBlock) << endl;
-    
-    //printVec(state, n, N, false);
-    printVecProbs(state, n, N, false);
-    
-    cudaFree(state);
-    return 0;
-    
     /* Uniform superposition: */
     /*for (int i = 0; i < n; ++i) {
         state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));    
     }
     //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
     state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
-    state = applyOperator(state, CPhase(n, 0,1, 0.1));
-
-    printVec(state, n, N, false);*/
-    //printVecProbs(state, n, N, false);
+    state = applyOperator(state, CPhase(n, 0,1, 0.1));*/
+    cudaFree(state);
+    return 0;
 }
 
 int main(){
-    int n = 3;
+    int n = 4;
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
     get_pi_estimate(n, N, blocks, threadsPerBlock);
-    //cout << get_pi_estimate(n, N, blocks, threadsPerBlock) << endl;
-
-    /*cuDoubleComplex* uni = uniform(N,blocks,threadsPerBlock)
-    
-    for(int i = 0; i < N; i++){
-        cout << uni[i] << endl;
-    }*/
 }
