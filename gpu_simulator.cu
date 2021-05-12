@@ -50,7 +50,7 @@ __global__ void
 assignAll(cuDoubleComplex *vec, long N, cuDoubleComplex val) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
-    for(int i = id * numPerThread; i < id * (numPerThread + 1) && i < N; ++i) {
+    for(int i = id * numPerThread; i < ((id + 1) * numPerThread) && i < N; ++i) {
         vec[id] = val;
     }
 }
@@ -59,7 +59,7 @@ __device__ void
 assignAllDoublesDevice(double *vec, long N, double val) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
-    for(int i = id * numPerThread; i < id * (numPerThread + 1) && i < N; ++i) {
+    for(int i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; ++i) {
         vec[id] = val;
     }
 }
@@ -82,16 +82,16 @@ totalMag (cuDoubleComplex *state, long N, double *temp, double *ans) {
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     assignAllDoublesDevice(temp, blockDim.x * gridDim.x, 0.0);
     double sum = 0;
-    for (int i = id * numPerThread; i < id * (numPerThread + 1) && i < N; ++i) {
+    for (int i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; ++i) {
         sum += norm(state[i]);
     }
+
     temp[id] = sum;
     __syncthreads();
     sumReductionHelper(id, temp, ans);
 }
 
-
-bool isNormalized(cuDoubleComplex *state, const long N, int blocks, int threadsPerBlock) {
+double isNormalized(cuDoubleComplex *state, const long N, int blocks, int threadsPerBlock) {
     double* temp;
     double* ansDevice;
     cudaMalloc((void **)&temp, sizeof(double) * blocks * threadsPerBlock);
@@ -101,7 +101,7 @@ bool isNormalized(cuDoubleComplex *state, const long N, int blocks, int threadsP
     cudaMemcpy(&ansHost, ansDevice, sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(temp);
     cudaFree(ansDevice);
-    return (abs(ansHost - 1.0) < 1e-13);
+    return ansHost;//(abs(ansHost - 1.0) < 1e-13);
 }
 
 cuDoubleComplex* uniform(const long N, int blocks, int threadsPerBlock) {
@@ -394,11 +394,11 @@ long getCorrectBitsForPiEstimate(long bits, int n){
 
 int get_pi_estimate(const int n, const int N, int blocks, int threadsPerBlock){
     //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
-    cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
+    cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
     cout << isNormalized(state, N, blocks, threadsPerBlock) << endl;
     
     //printVec(state, n, N, false);
-    //printVecProbs(state, n, N, false);
+    printVecProbs(state, n, N, false);
     
     cudaFree(state);
     return 0;
@@ -420,7 +420,8 @@ int main(){
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
-    cout << get_pi_estimate(n, N, blocks, threadsPerBlock) << endl;
+    get_pi_estimate(n, N, blocks, threadsPerBlock);
+    //cout << get_pi_estimate(n, N, blocks, threadsPerBlock) << endl;
 
     /*cuDoubleComplex* uni = uniform(N,blocks,threadsPerBlock)
     
