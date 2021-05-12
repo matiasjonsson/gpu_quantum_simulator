@@ -1,0 +1,1 @@
+nvcc simulator.cpp gpu_simulator.cu -O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc -o gpu_simulator

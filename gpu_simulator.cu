@@ -6,9 +6,26 @@
 #include <complex>
 #include <cuComplex.h>
 #include <assert.h>
-
 #include <cusparse.h>
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <driver_functions.h>
+
+#include "CycleTimer.h"
+
+
 using namespace std;
+
+typedef enum GateType{
+    IDENTITY,
+    NOT,
+    HADAMARD
+}GateType;
+
+float toBW(int bytes, float sec) {
+  return static_cast<float>(bytes) / (1024. * 1024. * 1024.) / sec;
+}
 
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
@@ -456,7 +473,7 @@ long getCorrectBitsForPiEstimate(long bits, int n){
     return answer;
 }
 
-int get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
+int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
     //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
     cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
     cuDoubleComplex* newState = zero(N, blocks, threadsPerBlock);
@@ -489,9 +506,25 @@ int get_pi_estimate(const int n, const int N, const int blocks, const int thread
 }
 
 int main(){
-    int n = 1;
+    int n = 10;
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
+    
+    //gpu time includes time for allocation, transfer, and execution
+    double gpu_start_time = CycleTimer::currentSeconds();
+    gpu_get_pi_estimate(n, N, blocks, threadsPerBlock);
+    double gpu_end_time = CycleTimer::currentSeconds();
+    
+    //TODO Add Bandwidth Calculation
+    printf("Total GPU Time: %.3f ms\t\t", 1000.f * (gpu_end_time-gpu_start_time));
+    /*
+    double cpu_start_time = CycleTimer::currentSeconds();
     get_pi_estimate(n, N, blocks, threadsPerBlock);
+    double cpu_end_time = CycleTimer::currentSeconds();
+
+    printf("Total CPU Time: %.3f ms\t\t", 1000.f * (cpu_end_time-cpu_start_time));
+    */
+
+    return 0;
 }
