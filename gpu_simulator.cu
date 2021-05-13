@@ -395,47 +395,83 @@ tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen,
 
 /* Two qubit gates */
 
-__device__ void
+/* Does not need to check if gate has capacity enough, because CNOT has exactly 2^n nonzero
+ * elements and that is the initial (and also minimal) size of the gate array. */
+__global__ void
 CNOTExpanded(sparse_elt* gate, const int n, const long N, const int u, const int v) { 
-    gate[0] = createElt(N, N, make_cuDoubleComplex(0.0, 0.0));
+    gate[0] = createElt(N+1, N, make_cuDoubleComplex(0.0, 0.0));
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     int j;
     for(int i = id * numPerThread; i < (id+1) * numPerThread && i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             j = i ^ (0x1<<(n-v-1));
-            gate[i] = createElt(i, j, make_cuDoubleComplex(1.0, 0.0));
+            gate[i+1] = createElt(i, j, make_cuDoubleComplex(1.0, 0.0));
         } else {
-            gate[i] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
+            gate[i+1] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
+        }
+    }
+}
+
+__device__ void
+mult(sparse_elt* U1, int whichIndex, cuDoubleComplex* ans) {
+    ans[0] = make_cuDoubleComplex(0.0, 0.0);
+    ans[1] = make_cuDoubleComplex(0.0, 0.0);
+    for(int i = 1; i < U1[0].u; ++i) {
+        if(U1[i].v == whichIndex){
+            ans[U1[i].u] = U1[i].amp;
+        }
+    }
+}
+
+__global__ void
+CU1Expanded(sparse_elt* gate, sparse_elt* U1, int* eltsPerThread, const int n, const long N, const int u, const int v, long gateLen, bool* successDevice) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
+
+    if((N/4) * ((U1[0].u) + 1) > gateLen) {
+        if(id == 0) { *successDevice = false; }
+        return;
+    } else {
+        if(id == 0) { *successDevice = true; }
+    }
+    gate[0] = createElt(N+1, N, make_cuDoubleComplex(0.0, 0.0));
+    cuDoubleComplex stateOfV[2];
+    int numEltsForThisThread = 0;
+    for(long i = id * numPerThread + 1; i < (id + 1) * numPerThread && i < N; ++i) {
+        if (i>>(n-u-1) & 0x1) {
+            mult(U1, (i>>(n-v-1)) & 0x1, stateOfV);
+            if(!equalsZero(stateOfV[0])) {
+                numEltsForThisThread++;
+            }
+            if(!equalsZero(stateOfV[1])) {
+                numEltsForThisThread++;
+            }
+        } else {
+            numEltsForThisThread++;
+        }
+    }
+    eltsPerThread[id] = numEltsForThisThread;
+    scan(eltsPerThread, id);
+    for(long i = id * numPerThread + 1; i < (id + 1) * numPerThread && i < N; ++i) {
+        if (i>>(n-u-1) & 0x1) {
+            mult(U1, (i>>(n-v-1)) & 0x1, stateOfV);
+            if(!equalsZero(stateOfV[0])) {
+                //gate[someIndex] = createElt(i, i & ~(0x1L<<(n-v-1)), stateOfV[0]);
+            }
+            if(!equalsZero(stateOfV[1])) {
+                //gate[someIndex] = createElt(i, i | (0x1L<<(n-v-1)), stateOfV[1]);
+            }
+        } else {
+            //gate[someIndex] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
         }
     }
 }
 /*
-vector<sparse_elt> CU1Expanded(vector<sparse_elt> U1, const int n, const int u, const int v) {
-    vector<sparse_elt> CU1;
-    long N = pow(2, n);
-    CU1.push_back(createElt(N, N, 0.0));
-    vector<complex<double> > stateOfV;
-    for(long i = 0; i < N; ++i) {
-        if (i>>(n-u-1) & 0x1) {
-            stateOfV = classical(2, (i>>(n-v-1)) & 0x1);
-            stateOfV = applyOperator(stateOfV, U1);
-            if(!equalsZero(stateOfV.data()[0])) {
-                CU1.push_back(createElt(i, i & ~(0x1L<<(n-v-1)), stateOfV.data()[0]));
-            }
-            if(!equalsZero(stateOfV.data()[1])) {
-                CU1.push_back(createElt(i, i | (0x1L<<(n-v-1)), stateOfV.data()[1]));
-            }
-        } else {
-            CU1.push_back(createElt(i, i, 1.0));
-        }
-    }
-    return CU1;
-}
 vector<sparse_elt> CPhase(const int n, const int u, const int v, double phi) {
     return CU1Expanded(phase(phi), n, u, v);
-}
-
+}*/
+/*
 vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
     assert(u != v);
     vector<sparse_elt> swp;
@@ -507,36 +543,41 @@ void applyOneQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
     } while (!(success && gate_n >= n));
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
+    cudaFree(successDevice);
 }
 
-/*void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate,
+void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate, sparse_elt** gateScratch,
                            const int n, const long N, long* gateLen,
-                           const int u, TwoQubitGateType whichGate, double param,
+                           const int u, const int v, TwoQubitGateType whichGate, double param,
                            const int blocks, const int threadsPerBlock) {
     bool *successDevice;
     cudaMalloc((void**)&successDevice, sizeof(bool));
     bool success = true;
     cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
-    
-    int gate_n = 0;
     do {
         if (!success) {
             cudaFree(*gate);
             cudaFree(*gateScratch);
-            *gateLen = 2 * (*gateLen);
+            *gateLen = (*gateLen) * 2;
             cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
             cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
-            success = true;
-            gate_n = 0;
         }
-        tensorKernel<<<blocks, threadsPerBlock>>> (*gate, *gateScratch, *gateLen, whichGate, param, u, gate_n, successDevice);
-        swapPtrsGate(gate, gateScratch);
+        switch(whichGate){
+            case CNOT:
+            CNOTExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
+            break;
+            
+            /*case CPhase:
+            CPhaseExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v, *gateLen, successDevice);
+            break;*/
+        }
         cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
-        gate_n++;
-    } while (!(success && gate_n >= n));
+    } while (!success);
+    
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
-}*/
+    cudaFree(successDevice);
+}
 
 
 
@@ -599,7 +640,8 @@ int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int th
     long gateLen = N;
     //cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
     cudaDeviceSynchronize();
-    applyOneQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 2, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
+    applyOneQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 0, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
+    applyTwoQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 0, 1, CNOT, NO_PARAM, blocks, threadsPerBlock); 
     
     printVec(state, n, N, false);
     //printVecProbs(state, n, N, false);
@@ -615,7 +657,7 @@ int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int th
 }
 
 int main(){
-    int n = 4;
+    int n = 2;
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
