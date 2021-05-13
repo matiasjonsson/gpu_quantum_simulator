@@ -28,6 +28,7 @@ typedef enum OneQubitGateType{
 
 typedef enum TwoQubitGateType{
     CNOT,
+    CU1,
     CPhase
 } TwoQubitGateType;
 
@@ -309,17 +310,25 @@ phase(double phi) {
 }
 
 
-
-
 /* The answer gets written into gateScratch */
 __device__ void
-tensor(sparse_elt* gate1, sparse_elt* gate2, sparse_elt* gateScratch) {
+tensor(sparse_elt* gate1, sparse_elt* gate2, sparse_elt* gateScratch, int gate_n, long gateLen, bool *successDevice) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
     long num1 = gate1[0].u;
     long num2 = gate2[0].u;
     long dim1 = gate1[0].v;
     long dim2 = gate2[0].v;
+    if(gate_n != 0 && (num1-1) * (num2 - 1) > gateLen) {
+        *successDevice = false;
+        __syncthreads();
+        return;
+    }
+    else{
+        *successDevice = true;
+        __syncthreads();
+    }
+
     if(id == 0) {
         gateScratch[0] = createElt((num1-1) * (num2-1) + 1, dim1 * dim2, make_cuDoubleComplex(0.0, 0.0));
     }
@@ -344,8 +353,9 @@ copyGate(sparse_elt* dest, sparse_elt* U1){
     }
 }
 
-__global__ void tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen, 
-                             OneQubitGateType whichGate, double param, const int u, int gate_n, bool* successdevice) {
+__global__ void
+tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen, 
+                             OneQubitGateType whichGate, double param, const int u, int gate_n, bool *successDevice) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ sparse_elt* U1;
     __shared__ sparse_elt* I;
@@ -372,34 +382,35 @@ __global__ void tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gat
     __syncthreads();
     if(gate_n == 0) {
         if(id == 0) {
+            *successDevice = true;
             if(u == 0) { copyGate(gateScratch, U1); }
             else { copyGate(gateScratch, I); }
         }
     }
     else {
-        if(gate_n == u) { tensor(gate, U1, gateScratch); }
-        else { tensor(gate, I, gateScratch); }
+        if(gate_n == u) { tensor(gate, U1, gateScratch, gate_n, gateLen, successDevice); }
+        else { tensor(gate, I, gateScratch, gate_n, gateLen, successDevice); }
     }
-    
 }
 
 /* Two qubit gates */
-/*
-vector<sparse_elt> CNOTExpanded(const int n, const int u, const int v) { 
-    vector<sparse_elt> cnot;
-    long N = pow(2, n);
-    cnot.push_back(createElt(N, N, 0.0));
+
+__device__ void
+CNOTExpanded(sparse_elt* gate, const int n, const long N, const int u, const int v) { 
+    gate[0] = createElt(N, N, make_cuDoubleComplex(0.0, 0.0));
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     int j;
-    for(int i = 0; i < N; ++i) {
+    for(int i = id * numPerThread; i < (id+1) * numPerThread && i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             j = i ^ (0x1<<(n-v-1));
-            cnot.push_back(createElt(i, j, 1.0));
+            gate[i] = createElt(i, j, make_cuDoubleComplex(1.0, 0.0));
         } else {
-            cnot.push_back(createElt(i, i, 1.0));
+            gate[i] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
         }
     }
-    return cnot;
 }
+/*
 vector<sparse_elt> CU1Expanded(vector<sparse_elt> U1, const int n, const int u, const int v) {
     vector<sparse_elt> CU1;
     long N = pow(2, n);
@@ -479,6 +490,33 @@ void applyOneQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
     cudaMalloc((void**)&successDevice, sizeof(bool));
     bool success = true;
     cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
+    int gate_n = 0;
+    do {
+        if (!success) {
+            cudaFree(*gate);
+            cudaFree(*gateScratch);
+            *gateLen = (*gateLen) * 2;
+            cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
+            cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
+            gate_n = 0;
+        }
+        tensorKernel<<<blocks, threadsPerBlock>>> (*gate, *gateScratch, *gateLen, whichGate, param, u, gate_n, successDevice);
+        swapPtrsGate(gate, gateScratch);
+        cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
+        gate_n++;
+    } while (!(success && gate_n >= n));
+    applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
+    swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
+}
+
+/*void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate,
+                           const int n, const long N, long* gateLen,
+                           const int u, TwoQubitGateType whichGate, double param,
+                           const int blocks, const int threadsPerBlock) {
+    bool *successDevice;
+    cudaMalloc((void**)&successDevice, sizeof(bool));
+    bool success = true;
+    cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
     
     int gate_n = 0;
     do {
@@ -498,20 +536,7 @@ void applyOneQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
     } while (!(success && gate_n >= n));
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
-    /*assignAll<<<blocks, threadsPerBlock>>>(*gateScratch1, (*gateScratchSize)+1, make_cuDoubleComplex(0.0,0.0));
-    assignAll<<<blocks, threadsPerBlock>>>(*gateScratch2, (*gateScratchSize)+1, make_cuDoubleComplex(0.0,0.0));*/
-    
-    /*__shared__ long sizeOfSparse;
-    sizeOfSparse = unitary[0].u;
-    assert(unitary[0].v == N);
-    int id = blockIdx.x * blockDim.x + threadIdx.x;
-    int numPerThread = max(sizeOfSparse / (blockDim.x * gridDim.x), 1L);
-    for(long i = (id * numPerThread) + 1; i < ((id + 1) * numPerThread) + 1 && i < sizeOfSparse; ++i) {
-        atomicComplexAdd(&newstate[unitary[i].u], cuCmul(unitary[i].amp, state[unitary[i].v]));
-    }*/
-}
-
-
+}*/
 
 
 
@@ -576,7 +601,7 @@ int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int th
     cudaDeviceSynchronize();
     applyOneQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 2, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
     
-    //printVec(state, n, N, false);
+    printVec(state, n, N, false);
     //printVecProbs(state, n, N, false);
     
     
