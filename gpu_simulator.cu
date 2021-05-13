@@ -17,14 +17,22 @@
 
 using namespace std;
 
-typedef enum GateType{
+typedef enum OneQubitGateType{
     IDENTITY,
     NOT,
-    HADAMARD
-}GateType;
+    HADAMARD,
+    PHASE
+} OneQubitGateType;
+
+#define NO_PARAM 0.0 
+
+typedef enum TwoQubitGateType{
+    CNOT,
+    CPhase
+} TwoQubitGateType;
 
 float toBW(int bytes, float sec) {
-  return static_cast<float>(bytes) / (1024. * 1024. * 1024.) / sec;
+    return static_cast<float>(bytes) / (1024. * 1024. * 1024.) / sec;
 }
 
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
@@ -35,15 +43,8 @@ struct sparse_elt {
     cuDoubleComplex amp;
 };
 
-sparse_elt createEltHost(int u, int v, cuDoubleComplex amp) {
-    sparse_elt elt;
-    elt.u = u;
-    elt.v = v;
-    elt.amp = amp;
-    return elt;
-}
 __device__ sparse_elt
-createEltDevice(int u, int v, cuDoubleComplex amp) {
+createElt(long u, long v, cuDoubleComplex amp) {
     sparse_elt elt;
     elt.u = u;
     elt.v = v;
@@ -69,12 +70,31 @@ bool equalsZeroHost(cuDoubleComplex amplitude) {
     return (normHost(amplitude) < 1e-15);
 }
 
+__device__ void
+atomicComplexAdd(cuDoubleComplex* ptr, cuDoubleComplex valToAdd) {
+    double2 *newPtr = (double2*) ptr;
+    double2 newVal = (double2) valToAdd;
+    atomicAdd(&(newPtr->x), newVal.x);
+    atomicAdd(&(newPtr->y), newVal.y);
+}
+
+
 
 __global__ void
 assignAll(cuDoubleComplex *vec, const long N, cuDoubleComplex val) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     for(int i = id * numPerThread; i < ((id + 1) * numPerThread) && i < N; ++i) {
+        vec[id] = val;
+    }
+}
+
+
+__device__ void
+assignAllDevice(cuDoubleComplex *vec, const long N, cuDoubleComplex val) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
+    for(int i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; ++i) {
         vec[id] = val;
     }
 }
@@ -97,7 +117,7 @@ assignOne(cuDoubleComplex *vec, const long N, cuDoubleComplex val, const long wh
 
 /* These reduction helpers require that vec is of length blockDim * gridDim. */
 __device__ void
-sumReductionHelper(int id, double *vec, double *ans){
+sumReductionHelper(int id, double *vec, double *ans) {
     __shared__ double sum;
     sum = 0.0;
     atomicAdd(&sum, vec[id]);
@@ -107,7 +127,7 @@ sumReductionHelper(int id, double *vec, double *ans){
     }
 }
 __device__ void
-maxReductionHelper(int id, unsigned long long int *vec, unsigned long long int *ans){
+maxReductionHelper(int id, unsigned long long int *vec, unsigned long long int *ans) {
     __shared__ unsigned long long int max;
     max = 0;
     atomicMax(&max, vec[id]);
@@ -162,7 +182,7 @@ cuDoubleComplex* zero(const long N, const int blocks, const int threadsPerBlock)
     return state;
 }
 
-cuDoubleComplex* classical(const long N, const long which, const int blocks, const int threadsPerBlock){
+cuDoubleComplex* classical(const long N, const long which, const int blocks, const int threadsPerBlock) {
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignOne<<<blocks, threadsPerBlock>>>(state, N, make_cuDoubleComplex(1.0, 0.0), which);
@@ -232,77 +252,136 @@ getMostLikely(cuDoubleComplex* state, unsigned long long int* temp, const int n,
 }
 
 
+__device__ void 
+printOp(sparse_elt* U) {
+    printf("Operator\n");
+    for(int i = 0; i < U[0].u; ++i) {
+        printf("(%d, %d), %f + %f i\n", (int)U[i].u, (int)U[i].v, cuCreal(U[i].amp), cuCimag(U[i].amp));
+    }
+}
+
 /* One qubit gates */ 
-
-sparse_elt* identity(){
-    sparse_elt* idDevice;
-    cudaMalloc((void**)&idDevice, 3 * sizeof(sparse_elt));
+__device__ sparse_elt*
+identity(){
+    __shared__ sparse_elt id[3];
     // dimensions
-    sparse_elt idHost[3];
-    idHost[0] = createEltHost(3, 2, make_cuDoubleComplex(0.0, 0.0));
+    id[0] = createElt(3, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    idHost[1] = createEltHost(0, 0, make_cuDoubleComplex(1.0, 0.0));
-    idHost[2] = createEltHost(1, 1, make_cuDoubleComplex(1.0, 0.0));
-    cudaMemcpy(idDevice, &idHost, 3 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
-    return idDevice;
+    id[1] = createElt(0, 0, make_cuDoubleComplex(1.0, 0.0));
+    id[2] = createElt(1, 1, make_cuDoubleComplex(1.0, 0.0));
+    return id;
 }
 
-sparse_elt* naught() {
-    sparse_elt* cxDevice;
-    cudaMalloc((void**)&cxDevice, 3 * sizeof(sparse_elt));
-    sparse_elt cxHost[3];
+__device__ sparse_elt*
+naught() {
+    __shared__ sparse_elt cx[3];
     // dimensions
-    cxHost[0] = createEltHost(3, 2, make_cuDoubleComplex(0.0, 0.0));
+    cx[0] = createElt(3, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    cxHost[1] = createEltHost(1, 0, make_cuDoubleComplex(1.0, 0.0));
-    cxHost[2] = createEltHost(0, 1, make_cuDoubleComplex(1.0, 0.0));
-    cudaMemcpy(cxDevice, &cxHost, 3 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
-    return cxDevice;
+    cx[1] = createElt(1, 0, make_cuDoubleComplex(1.0, 0.0));
+    cx[2] = createElt(0, 1, make_cuDoubleComplex(1.0, 0.0));
+    return cx;
 }
 
-sparse_elt* hadamard() {
-    sparse_elt* hadDevice;
-    cudaMalloc((void**)&hadDevice, 5 * sizeof(sparse_elt));
-    sparse_elt hadHost[5];
+__device__ sparse_elt*
+hadamard() {
+    __shared__ sparse_elt had[5];
     // dimensions
-    hadHost[0] = createEltHost(5, 2, make_cuDoubleComplex(0.0, 0.0));
+    had[0] = createElt(5, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    double norm = 1.0 / sqrt(2);
-    hadHost[1] = createEltHost(0, 0, make_cuDoubleComplex(norm, 0.0));
-    hadHost[2] = createEltHost(0, 1, make_cuDoubleComplex(norm, 0.0));
-    hadHost[3] = createEltHost(1, 0, make_cuDoubleComplex(norm, 0.0));
-    hadHost[4] = createEltHost(1, 1, make_cuDoubleComplex(-norm, 0.0));
-    cudaMemcpy(hadDevice, &hadHost, 5 * sizeof(sparse_elt), cudaMemcpyHostToDevice);
-    return hadDevice;
+    double c = 1.0 / sqrt(2.0);
+    had[1] = createElt(0, 0, make_cuDoubleComplex(c, 0.0));
+    had[2] = createElt(0, 1, make_cuDoubleComplex(c, 0.0));
+    had[3] = createElt(1, 0, make_cuDoubleComplex(c, 0.0));
+    had[4] = createElt(1, 1, make_cuDoubleComplex(-c, 0.0));
+    return had;
 }
-/*
-vector<sparse_elt> phase(double phi){
-    vector<sparse_elt> phase;
+
+__device__ sparse_elt*
+phase(double phi) {
+    __shared__ sparse_elt phase[3];
     // dimensions
-    phase.push_back(createElt(2,2, 0.0));
+    phase[0] = createElt(2, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
-    phase.push_back(createElt(0,0, 1.0));
-    complex<double> ex (cos(phi), sin(phi));
-    phase.push_back(createElt(1,1,ex));
+    phase[1] = createElt(0, 0, make_cuDoubleComplex(1.0, 0.0));
+    phase[2] = createElt(1, 1, make_cuDoubleComplex(cos(phi), sin(phi)));
     return phase;
 }
-*/
 
-/* Expanding operations for 1 qubit gates. */
 
-/* It is much more efficient to do many 1 qubit gates sequentially than to compute their tensor product */
-/*
-vector<sparse_elt> oneQubitGateExpand(vector<sparse_elt> oneQubitGate, const int n, const int which) {
-    vector<sparse_elt> total = (which == 0 ? oneQubitGate : identity());
-    for(int i = 1; i < n; ++i) {
-        if(which == i) 
-            total = tensor(total, oneQubitGate);
-        else
-            total = tensor(total, identity());
+
+
+/* The answer gets written into gateScratch */
+__device__ void
+tensor(sparse_elt* gate1, sparse_elt* gate2, sparse_elt* gateScratch) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    long num1 = gate1[0].u;
+    long num2 = gate2[0].u;
+    long dim1 = gate1[0].v;
+    long dim2 = gate2[0].v;
+    if(id == 0) {
+        gateScratch[0] = createElt((num1-1) * (num2-1) + 1, dim1 * dim2, make_cuDoubleComplex(0.0, 0.0));
     }
-    return total;
+
+    int numPerThread = max(num1 / (blockDim.x * gridDim.x), 1L);
+
+    for(long i = (id * numPerThread) + 1; i < (((id + 1) * numPerThread) + 1) && i < num1; ++i) {
+        for(long j = 1; j < num2; ++j) {
+            gateScratch[(i-1)*(num2-1) + j] = 
+                createElt(gate1[i].u * dim2 + gate2[j].u,
+                          gate1[i].v * dim2 + gate2[j].v,
+                          cuCmul(gate1[i].amp, gate2[j].amp));
+        }
+    }
 }
-*/
+
+__device__ void
+copyGate(sparse_elt* dest, sparse_elt* U1){
+    long num_gates = U1[0].u;
+    for(int i = 0; i < num_gates; ++i){
+        dest[i] = U1[i];
+    }
+}
+
+__global__ void tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen, 
+                             OneQubitGateType whichGate, double param, const int u, int gate_n, bool* successdevice) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ sparse_elt* U1;
+    __shared__ sparse_elt* I;
+    if(id == 0) {
+        I = identity();
+        switch(whichGate){
+            case HADAMARD:
+            U1 = hadamard();
+            break;
+            
+            case NOT:
+            U1 = naught();
+            break;
+            
+            case IDENTITY:
+            U1 = identity();
+            break;
+
+            case PHASE:
+            U1 = phase(param);
+            break;
+        }
+    }
+    __syncthreads();
+    if(gate_n == 0) {
+        if(id == 0) {
+            if(u == 0) { copyGate(gateScratch, U1); }
+            else { copyGate(gateScratch, I); }
+        }
+    }
+    else {
+        if(gate_n == u) { tensor(gate, U1, gateScratch); }
+        else { tensor(gate, I, gateScratch); }
+    }
+    
+}
 
 /* Two qubit gates */
 /*
@@ -366,63 +445,74 @@ vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
 }
 */
 
-__device__ void
-atomicComplexAdd(cuDoubleComplex* ptr, cuDoubleComplex valToAdd) {
-    double2 *newPtr = (double2*) ptr;
-    double2 newVal = (double2) valToAdd;
-    atomicAdd(&(newPtr->x), newVal.x);
-    atomicAdd(&(newPtr->y), newVal.y);
+/* Call swapPtrs after every applyOperator and every tensor product. */
+void swapPtrsState(cuDoubleComplex** state, cuDoubleComplex** stateScratch, const int N, const int blocks, const int threadsPerBlock) {
+    cudaDeviceSynchronize();
+    cuDoubleComplex* temp = *state;
+    *state = *stateScratch;
+    *stateScratch = temp;
+    assignAll<<<blocks, threadsPerBlock>>>(*stateScratch, N, make_cuDoubleComplex(0.0,0.0));
+    cudaDeviceSynchronize();
+}
+void swapPtrsGate(sparse_elt** state, sparse_elt** stateScratch) {
+    cudaDeviceSynchronize();
+    sparse_elt* temp = *state;
+    *state = *stateScratch;
+    *stateScratch = temp;
 }
 
 __global__ void
-applyOperator(cuDoubleComplex* state, cuDoubleComplex* newstate, const long N, sparse_elt* unitary) {
-    __shared__ long sizeOfSparse;
+applyOperatorKernel(cuDoubleComplex* state, cuDoubleComplex* stateScratch, sparse_elt* gate) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    long numElts = gate[0].u;
+    int numPerThread = max(numElts / (blockDim.x * gridDim.x), 1L);
+    for(int i = (id * numPerThread) + 1; i < ((id+1)*numPerThread) + 1 && i < numElts; ++i) {
+        atomicComplexAdd(&(stateScratch[gate[i].u]), cuCmul(gate[i].amp, state[gate[i].v]));
+    }
+}
+
+void applyOneQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate, sparse_elt** gateScratch,
+                           const int n, const long N, long* gateLen,
+                           const int u, OneQubitGateType whichGate, double param,
+                           const int blocks, const int threadsPerBlock) {
+    bool *successDevice;
+    cudaMalloc((void**)&successDevice, sizeof(bool));
+    bool success = true;
+    cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
+    
+    int gate_n = 0;
+    do {
+        if (!success) {
+            cudaFree(*gate);
+            cudaFree(*gateScratch);
+            *gateLen = 2 * (*gateLen);
+            cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
+            cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
+            success = true;
+            gate_n = 0;
+        }
+        tensorKernel<<<blocks, threadsPerBlock>>> (*gate, *gateScratch, *gateLen, whichGate, param, u, gate_n, successDevice);
+        swapPtrsGate(gate, gateScratch);
+        cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
+        gate_n++;
+    } while (!(success && gate_n >= n));
+    applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
+    swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
+    /*assignAll<<<blocks, threadsPerBlock>>>(*gateScratch1, (*gateScratchSize)+1, make_cuDoubleComplex(0.0,0.0));
+    assignAll<<<blocks, threadsPerBlock>>>(*gateScratch2, (*gateScratchSize)+1, make_cuDoubleComplex(0.0,0.0));*/
+    
+    /*__shared__ long sizeOfSparse;
     sizeOfSparse = unitary[0].u;
     assert(unitary[0].v == N);
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(sizeOfSparse / (blockDim.x * gridDim.x), 1L);
     for(long i = (id * numPerThread) + 1; i < ((id + 1) * numPerThread) + 1 && i < sizeOfSparse; ++i) {
         atomicComplexAdd(&newstate[unitary[i].u], cuCmul(unitary[i].amp, state[unitary[i].v]));
-    }
-}
-/* Call swapPtrs after every applyOperator. */
-void swapPtrs(cuDoubleComplex** state, cuDoubleComplex** newState, const int N, const int blocks, const int threadsPerBlock) {
-    cuDoubleComplex* temp = *state;
-    *state = *newState;
-    *newState = temp;
-    assignAll<<<blocks, threadsPerBlock>>>(*newState, N, make_cuDoubleComplex(0.0,0.0));
+    }*/
 }
 
-/*
-vector<sparse_elt> tensor(vector<sparse_elt> u1, vector<sparse_elt> u2) {
-    int dim1 = u1.begin()->u;
-    int dim2 = u2.begin()->u;
-    vector<sparse_elt> u3;
-    u3.push_back(createElt(dim1*dim2, dim1*dim2, 0.0));
-    for(auto i = u1.begin() + 1; i != u1.end(); ++i) {
-        for(auto j = u2.begin() + 1; j != u2.end(); ++j) {
-            u3.push_back(createElt(i->u * dim2 + j->u, i->v * dim2 + j->v, i->amp * j->amp));
-        }
-    }
-    return u3;
-}
-*/
 
-/*
-void printOp(vector<sparse_elt> U) {
-    vector<vector<complex<double> > > densified;
-    int dim = U.begin()->u;
-    densified.assign(dim, zero(dim));
-    for (auto x = U.begin()+1; x != U.end(); ++x) {
-        densified.data()[x->u].data()[x->v] += x->amp;
-    }
-    for (int x = 0; x < dim; ++x) {
-        for (int y = 0; y < dim; ++y) {
-            cout << densified.data()[x].data()[y] << " ";
-        }
-        cout << "\n";
-    }
-}*/
+
 
 
 /* Pi estimation functions for benchmarking performance. */
@@ -476,37 +566,31 @@ long getCorrectBitsForPiEstimate(long bits, int n){
 int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
     //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
     cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
-    cuDoubleComplex* newState = zero(N, blocks, threadsPerBlock);
+    cuDoubleComplex* stateScratch = zero(N, blocks, threadsPerBlock);
+    sparse_elt* gate;
+    sparse_elt* gateScratch;
+    cudaMalloc((void**)&gate, (N + 1) * sizeof(sparse_elt));
+    cudaMalloc((void**)&gateScratch, (N + 1) * sizeof(sparse_elt));
+    long gateLen = N;
     //cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
     cudaDeviceSynchronize();
-    sparse_elt* id = identity();
-    sparse_elt* cx = naught();
-    sparse_elt* had = hadamard();
-    applyOperator<<<blocks, threadsPerBlock>>>(state, newState, N, had); 
-    swapPtrs(&state, &newState, N, blocks, threadsPerBlock);
+    applyOneQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 2, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
     
-    printVec(state, n, N, false);
+    //printVec(state, n, N, false);
     //printVecProbs(state, n, N, false);
     
     
-    cout << isNormalized(state, N, blocks, threadsPerBlock) << endl;
-    /* Uniform superposition: */
-    /*for (int i = 0; i < n; ++i) {
-        state = applyOperator(state, oneQubitGateExpand(hadamard(), n, i));    
-    }
-    //state = applyOperator(state, oneQubitGateExpand(hadamard(), n, 0));
-    state = applyOperator(state, oneQubitGateExpand(naught(), n, 0));
-    state = applyOperator(state, CPhase(n, 0,1, 0.1));*/
-    cudaFree(id);
-    cudaFree(cx);
-    cudaFree(had);
+    //cout << isNormalized(state, N, blocks, threadsPerBlock) << endl;
     cudaFree(state);
-    cudaFree(newState);
+    cudaFree(stateScratch);
+    cudaFree(gate);
+    cudaFree(gateScratch);
+    cudaDeviceSynchronize();
     return 0;
 }
 
 int main(){
-    int n = 10;
+    int n = 4;
     long N = pow(2, n);
     int threadsPerBlock = 256;
     int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
@@ -517,7 +601,7 @@ int main(){
     double gpu_end_time = CycleTimer::currentSeconds();
     
     //TODO Add Bandwidth Calculation
-    printf("Total GPU Time: %.3f ms\t\t", 1000.f * (gpu_end_time-gpu_start_time));
+    printf("Total GPU Time: %.3f ms\n", 1000.f * (gpu_end_time-gpu_start_time));
     /*
     double cpu_start_time = CycleTimer::currentSeconds();
     get_pi_estimate(n, N, blocks, threadsPerBlock);
