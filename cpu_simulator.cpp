@@ -8,6 +8,7 @@
 #include <bitset>
 using namespace std;
 
+#include "CycleTimer.h"
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
 struct sparse_elt {
@@ -314,10 +315,10 @@ double get_pi_estimate(const int n) {
 int main() {
     const int n = 8;
     //const int N = pow(2, n);
-
+    double cpu_start_time = CycleTimer::currentSeconds();
     cout << get_pi_estimate(n) << endl;
-    
-    
+    double cpu_end_time = CycleTimer::currentSeconds();
+    printf("Total CPU Time: %.3f ms\n", 1000.f * (cpu_end_time-cpu_start_time));
     
     //Testing functions out
     //vector<complex<double> > state = classical(N, 0);
