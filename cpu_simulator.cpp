@@ -306,13 +306,13 @@ double get_pi_estimate(const int n) {
     state = qft_dagger(state, n);
     //printVec(state, n+1, pow(2, n+1), false);
     long mostLikely = getMostLikely(state, n+1);
-    cout << mostLikely << endl;
+    //cout << mostLikely << endl;
     double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0,n);
     return 1.0 / (2 * theta);
 }
 
 int main() {
-    const int n = 10;
+    const int n = 8;
     //const int N = pow(2, n);
 
     cout << get_pi_estimate(n) << endl;
