@@ -304,8 +304,9 @@ long getCorrectBitsForPiEstimate(long bits, int n){
 double get_pi_estimate(const int n) {
     vector<complex<double> > state = qpe_pre(n);
     state = qft_dagger(state, n);
-    //printVec(state, n, pow(2, n), false);
+    //printVec(state, n+1, pow(2, n+1), false);
     long mostLikely = getMostLikely(state, n+1);
+    cout << mostLikely << endl;
     double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0,n);
     return 1.0 / (2 * theta);
 }

@@ -42,6 +42,7 @@ __global__ void
 scan_upsweep_kernel(int N, int twod, int twod1, int* device_data) {
     int index = twod1 * (blockIdx.x * blockDim.x + threadIdx.x);
     device_data[index+twod1-1] += device_data[index+twod-1];
+    
 }
 
 __global__ void
@@ -62,7 +63,7 @@ void exclusive_scan(int* device_data, int length)
     int N = nextPow2(length);
 
     int threadsPerBlock = 512;
-    int blocks = N / threadsPerBlock;
+    int blocks = max(N / threadsPerBlock, 1);
 
     // upsweep
     for (int twod = 1; twod < N; twod *= 2)
@@ -101,11 +102,11 @@ void cudaScan(int* inarray, int length, int* resultarray)
 
     cudaMemcpy(device_data, inarray, length * sizeof(int),
                cudaMemcpyDeviceToDevice);
-    cudaDeviceSynchronize();
+    gpuErrchk(cudaDeviceSynchronize());
     exclusive_scan(device_data, length);
 
     // Wait for any work left over to be completed.
-    cudaDeviceSynchronize();
+    gpuErrchk(cudaDeviceSynchronize());
 
     cudaMemcpy(resultarray, device_data, length * sizeof(int),
                cudaMemcpyDeviceToDevice);
@@ -134,13 +135,13 @@ float toBW(int bytes, float sec) {
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
 struct sparse_elt {
-    long long int u;
-    long long int v;
+    long u;
+    long v;
     cuDoubleComplex amp;
 };
 
 __device__ sparse_elt
-createElt(long long int u, long long int v, cuDoubleComplex amp) {
+createElt(long u, long v, cuDoubleComplex amp) {
     sparse_elt elt;
     elt.u = u;
     elt.v = v;
@@ -247,9 +248,10 @@ double isNormalized(cuDoubleComplex *state, const long N, const int blocks, cons
     double* ansDevice;
     cudaMalloc((void **)&temp, sizeof(double) * blocks * threadsPerBlock);
     cudaMalloc((void **)&ansDevice, sizeof(double));
+    double ansHost = 0.0;
+    cudaMemcpy(ansDevice, &ansHost, sizeof(double), cudaMemcpyHostToDevice);
     totalMag<<<blocks, threadsPerBlock>>> (state, N, temp, ansDevice);
     cudaDeviceSynchronize();
-    double ansHost = 0.0;
     cudaMemcpy(&ansHost, ansDevice, sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(temp);
     cudaFree(ansDevice);
@@ -531,7 +533,6 @@ mult(sparse_elt* U1, int whichIndex, cuDoubleComplex* ans) {
             ans[U1[i].u] = U1[i].amp;
         }
     }
-    //printf("%f\n",cuCabs(ans[0]));
 }
 __global__ void
 CU1ExpandedSetup(OneQubitGateType whichGate, double param, int* eltsPerThread, const int n, const long N, const int u, const int v, long gateLen, bool* successDevice) {
@@ -671,7 +672,6 @@ __global__ void
 applyOperatorKernel(cuDoubleComplex* state, cuDoubleComplex* stateScratch, sparse_elt* gate) {
 
     int id = blockIdx.x * blockDim.x + threadIdx.x;
-
     long numElts = gate[0].u;
     int numPerThread = max(numElts / (blockDim.x * gridDim.x), 1L);
     for(int i = (id * numPerThread) + 1; i < ((id+1)*numPerThread) + 1 && i < numElts; ++i) {
@@ -717,36 +717,35 @@ void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
     cudaMalloc((void**)&successDevice, sizeof(bool));
     bool success = true;
     cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
-    if (!success) {
-        cudaFree(*gate);
-        cudaFree(*gateScratch);
-        *gateLen = (*gateLen) * 2;
-        cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
-        cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
-    }
+    
     switch(whichGate){
         case CNOT:
         CNOTExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
-        cudaDeviceSynchronize();
+        gpuErrchk(cudaDeviceSynchronize());
         break;
         
         case CPHASE:
         int *numPerThread;
         cudaMalloc((void**)&numPerThread, sizeof(int) * blocks * threadsPerBlock);
-
         do {
+            if (!success) {
+                cudaFree(*gate);
+                cudaFree(*gateScratch);
+                *gateLen = (*gateLen) * 2;
+                cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
+                cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
+            }
             CU1ExpandedSetup<<<blocks, threadsPerBlock>>> (PHASE, param, numPerThread, n, N, u, v, *gateLen, successDevice);
-            cudaDeviceSynchronize();
+            gpuErrchk(cudaDeviceSynchronize());
             cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
         } while (!success);
 
         int *startIndices;
         cudaMalloc((void**)&startIndices, sizeof(int) * blocks * threadsPerBlock);
-
         cudaScan(numPerThread, (blocks * threadsPerBlock), startIndices);
-        cudaDeviceSynchronize();
+        gpuErrchk(cudaDeviceSynchronize());
         CU1Expanded<<<blocks, threadsPerBlock>>>(*gate, PHASE, param, startIndices, n, N, u, v);
-        cudaDeviceSynchronize();
+        gpuErrchk(cudaDeviceSynchronize());
         cudaFree(numPerThread);
         cudaFree(startIndices);
         break;
@@ -755,9 +754,8 @@ void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
         SWAPExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
         break;
     }
-    
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
-    cudaDeviceSynchronize();
+    gpuErrchk(cudaDeviceSynchronize());
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
     cudaFree(successDevice);
 }
@@ -774,13 +772,21 @@ void qft_dagger(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_
     const long N = pow(2, n_prime);
     for (int i = 0; i < n/2; ++i) {
         applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, i, n-i-1, SWAP, NO_PARAM, blocks, threadsPerBlock);   
+        gpuErrchk(cudaDeviceSynchronize());
     }
+
+
     for (int j = 0; j < n; ++j) {
         for (int m = 0; m < j; ++m) {
             double phi = -M_PI / ((double)pow(2, j - m));
             applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, j, m, CPHASE, phi, blocks, threadsPerBlock); 
+            gpuErrchk(cudaDeviceSynchronize());
+            cout << "IsNormalized inner " << isNormalized(*state, N, blocks, threadsPerBlock) << endl;
         }
-        applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, j, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
+        
+        applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, j, HADAMARD, NO_PARAM, blocks, threadsPerBlock);
+        gpuErrchk(cudaDeviceSynchronize()); 
+        //cout << "IsNormalized after had " << isNormalized(*state, N, blocks, threadsPerBlock) << endl;
     }
 }
 
@@ -792,12 +798,15 @@ void qpe_pre(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt
 
     for (int i = 0; i < n; ++i) {
         applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, i, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
+        gpuErrchk(cudaDeviceSynchronize());
     }
     applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, n, NOT, NO_PARAM, blocks, threadsPerBlock); 
+    gpuErrchk(cudaDeviceSynchronize());
 
     for (int i = n-1; i >= 0; --i) {
         for (int j = 0; j < pow(2, n-i-1); ++j) {
             applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, n, n-i-1, CPHASE, 1.0, blocks, threadsPerBlock); 
+            gpuErrchk(cudaDeviceSynchronize());
         }
     }
 }
@@ -828,12 +837,11 @@ double gpu_get_pi_estimate(const int n, const int blocks, const int threadsPerBl
     qft_dagger(&state, &stateScratch, &gate, &gateScratch, &gateLen, n, blocks, threadsPerBlock);
     
     long mostLikely = getMostLikelyHost(state, n_prime, N, blocks, threadsPerBlock);
-    //cout << mostLikely << endl;
+    cout << mostLikely << endl;
     double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0, n);
     
     //printVec(state, n_prime, N, false);
-    printVecProbs(state, n_prime, N, false);
-    
+    //printVecProbs(state, n_prime, N, false);
     
     cout << "IsNormalized " << isNormalized(state, N, blocks, threadsPerBlock) << endl;
     cudaDeviceSynchronize();
@@ -845,9 +853,9 @@ double gpu_get_pi_estimate(const int n, const int blocks, const int threadsPerBl
 }
 
 int main(){
-    int n = 2;
-    long long int N = pow(2, n+1); //Just for this purpose since we have an extra qubit in the circuit.
-    int threadsPerBlock = 256;
+    int n = 5;
+    long N = pow(2, n+1); //Just for this purpose since we have an extra qubit in the circuit.
+    int threadsPerBlock = 64;
     int blocks = (N + threadsPerBlock - 1)/threadsPerBlock;
 
     //gpu time includes time for allocation, transfer, and execution
