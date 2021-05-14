@@ -855,7 +855,7 @@ double gpu_get_pi_estimate(const int n, const int blocks, const int threadsPerBl
 int main(){
     int n = 8;
     long N = pow(2, n+1); //Just for this purpose since we have an extra qubit in the circuit.
-    int threadsPerBlock = 64;
+    int threadsPerBlock = 512;
     int blocks = (N + threadsPerBlock - 1)/threadsPerBlock;
 
     //gpu time includes time for allocation, transfer, and execution
