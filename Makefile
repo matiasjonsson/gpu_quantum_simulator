@@ -5,7 +5,7 @@ CXXFLAGS += -Wall -Wextra -g -O3 -DNDEBUG
 all: release
 
 
-NVCCFLAGS=-O0 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc
+NVCCFLAGS=-O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc
 LIBS += GL glut cudart
 
 
@@ -15,7 +15,7 @@ LDFRAMEWORKS := $(addprefix -framework , $(FRAMEWORKS))
 NVCC=nvcc
 
 
-release: simulator.cpp
+release:
 	g++ -std=c++11 cpu_simulator.cpp -o simulator $(CXXFLAGS)
 	nvcc gpu_simulator.cu -o fastsimulator $(NVCCFLAGS) $(LDLIBS)
 clean:
