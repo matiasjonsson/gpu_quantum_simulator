@@ -14,8 +14,103 @@
 
 #include "CycleTimer.h"
 
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 using namespace std;
+
+static inline int nextPow2(int n)
+{
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
+__global__ void
+scan_upsweep_kernel(int N, int twod, int twod1, int* device_data) {
+    int index = twod1 * (blockIdx.x * blockDim.x + threadIdx.x);
+    device_data[index+twod1-1] += device_data[index+twod-1];
+}
+
+__global__ void
+scan_lastIndex_kernel(int N, int* device_data) {
+    device_data[N-1] = 0;
+}
+
+__global__ void
+scan_downsweep_kernel(int N, int twod, int twod1, int* device_data) {
+    int index = twod1 * (blockIdx.x * blockDim.x + threadIdx.x);
+    int t = device_data[index+twod-1];
+    device_data[index+twod-1] = device_data[index+twod1-1];
+    device_data[index+twod1-1] += t;
+}
+
+void exclusive_scan(int* device_data, int length)
+{
+    int N = nextPow2(length);
+
+    int threadsPerBlock = 512;
+    int blocks = N / threadsPerBlock;
+
+    // upsweep
+    for (int twod = 1; twod < N; twod *= 2)
+    {
+        if (blocks > 1)
+            blocks /= 2;
+        else
+            threadsPerBlock /= 2;
+        int twod1 = twod * 2;
+
+        scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(N, twod, twod1, device_data);
+        cudaDeviceSynchronize();
+    }
+    scan_lastIndex_kernel<<<1, 1>>>(N, device_data);
+
+    // currently, threadsPerBlock = 1 and blocks = 1
+
+    // downsweep
+    for (int twod = N / 2; twod >= 1; twod /= 2)
+    {
+        int twod1 = twod * 2;
+        scan_downsweep_kernel<<<blocks, threadsPerBlock>>>(N, twod, twod1, device_data);
+        cudaDeviceSynchronize();
+        if (threadsPerBlock < 512)
+            threadsPerBlock *= 2;
+        else
+            blocks *= 2;
+    }
+}
+
+void cudaScan(int* inarray, int length, int* resultarray)
+{
+    int* device_data;
+    int rounded_length = nextPow2(length);
+    cudaMalloc((void **)&device_data, sizeof(int) * rounded_length);
+
+    cudaMemcpy(device_data, inarray, length * sizeof(int),
+               cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();
+    exclusive_scan(device_data, length);
+
+    // Wait for any work left over to be completed.
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(resultarray, device_data, length * sizeof(int),
+               cudaMemcpyDeviceToDevice);
+}
+
 
 typedef enum OneQubitGateType{
     IDENTITY,
@@ -28,8 +123,8 @@ typedef enum OneQubitGateType{
 
 typedef enum TwoQubitGateType{
     CNOT,
-    CU1,
-    CPhase
+    SWAP,
+    CPHASE
 } TwoQubitGateType;
 
 float toBW(int bytes, float sec) {
@@ -39,13 +134,13 @@ float toBW(int bytes, float sec) {
 // Sparse matrix reserves the first element for dimension, assuming matrix is square.
 // It is implemented using a vector.
 struct sparse_elt {
-    long u;
-    long v;
+    long long int u;
+    long long int v;
     cuDoubleComplex amp;
 };
 
 __device__ sparse_elt
-createElt(long u, long v, cuDoubleComplex amp) {
+createElt(long long int u, long long int v, cuDoubleComplex amp) {
     sparse_elt elt;
     elt.u = u;
     elt.v = v;
@@ -127,16 +222,7 @@ sumReductionHelper(int id, double *vec, double *ans) {
         atomicAdd(ans, sum);
     }
 }
-__device__ void
-maxReductionHelper(int id, unsigned long long int *vec, unsigned long long int *ans) {
-    __shared__ unsigned long long int max;
-    max = 0;
-    atomicMax(&max, vec[id]);
-    __syncthreads();
-    if(threadIdx.x == 0) {
-        atomicMax(ans, max);
-    }
-}
+
 
 
 __global__ void
@@ -162,6 +248,7 @@ double isNormalized(cuDoubleComplex *state, const long N, const int blocks, cons
     cudaMalloc((void **)&temp, sizeof(double) * blocks * threadsPerBlock);
     cudaMalloc((void **)&ansDevice, sizeof(double));
     totalMag<<<blocks, threadsPerBlock>>> (state, N, temp, ansDevice);
+    cudaDeviceSynchronize();
     double ansHost = 0.0;
     cudaMemcpy(&ansHost, ansDevice, sizeof(double), cudaMemcpyDeviceToHost);
     cudaFree(temp);
@@ -173,13 +260,14 @@ cuDoubleComplex* uniform(const long N, const int blocks, const int threadsPerBlo
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignAll<<<blocks, threadsPerBlock>>> (state, N, make_cuDoubleComplex(sqrt(1.0/N),0.0));
-    
+    cudaDeviceSynchronize();
     return state;
 }
 cuDoubleComplex* zero(const long N, const int blocks, const int threadsPerBlock) {
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignAll<<<blocks, threadsPerBlock>>>(state, N, make_cuDoubleComplex(0.0, 0.0));
+    cudaDeviceSynchronize();
     return state;
 }
 
@@ -187,6 +275,7 @@ cuDoubleComplex* classical(const long N, const long which, const int blocks, con
     cuDoubleComplex* state;
     cudaMalloc((void **)&state, sizeof(cuDoubleComplex) * N);
     assignOne<<<blocks, threadsPerBlock>>>(state, N, make_cuDoubleComplex(1.0, 0.0), which);
+    cudaDeviceSynchronize();
     return state;
 }
 
@@ -232,26 +321,47 @@ void printVecProbs(cuDoubleComplex* state, const int n, const long N, bool print
 
 
 __global__ void
-getMostLikely(cuDoubleComplex* state, unsigned long long int* temp, const int n, const long N, unsigned long long int *ans) {
+getMostLikely(cuDoubleComplex* state, long* answers, double* probs, const int n, const long N) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
-    if(id == 0) {
-        *ans = 0;
-    }
     double prob = 0.0;
 
     for (long i = id * numPerThread; i < ((id+1) * numPerThread) && i < N; i++) {
         if (norm(state[i]) > prob) {
             prob = norm(state[i]);
-            temp[id] = i;
+            answers[id] = i;
         }
     }
-    __syncthreads();
-    if(id < N) {
-        maxReductionHelper(id, temp, ans);
-    }
+    probs[id] = prob;
 }
+long getMostLikelyHost(cuDoubleComplex* state, const int n, const long N, const int blocks, const int threadsPerBlock) {
+    /*cudaMalloc((void**)&answers, sizeof(long)*blocks*threadsPerBlock);
+    cudaMalloc((void**)&probs, sizeof(double)*blocks*threadsPerBlock);
+    getMostLikely<<<blocks, threadsPerBlock>>>(state, answers, probs, n, N);
+    cudaDeviceSynchronize();
 
+    double *probsHost = (double*)malloc(sizeof(double)*blocks*threadsPerBlock);
+    cudaMemcpy(probsHost, probs, sizeof(double)*blocks*threadsPerBlock, cudaMemcpyDeviceToHost);
+    
+    */
+    cuDoubleComplex* stateHost = (cuDoubleComplex*)malloc(N * sizeof(cuDoubleComplex));
+    cudaMemcpy(stateHost, state, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+    double maxProb = 0.0;
+    long answer = 0;
+    for(long i = 0; i < N; ++i) {
+        if(normHost(stateHost[i]) > maxProb) {
+            answer = i;
+            maxProb = normHost(stateHost[i]);
+        }
+    }
+    /*long *answer = (long*)malloc(sizeof(long) * blocks * threadsPerBlock);
+    cudaMemcpy(&answer, answers, sizeof(long) * blocks * threadsPerBlock, cudaMemcpyDeviceToHost);
+    free(probsHost);
+    cudaFree(answers);
+    cudaFree(probs);*/
+    free(stateHost);
+    return answer;
+}
 
 __device__ void 
 printOp(sparse_elt* U) {
@@ -302,7 +412,7 @@ __device__ sparse_elt*
 phase(double phi) {
     __shared__ sparse_elt phase[3];
     // dimensions
-    phase[0] = createElt(2, 2, make_cuDoubleComplex(0.0, 0.0));
+    phase[0] = createElt(3, 2, make_cuDoubleComplex(0.0, 0.0));
     // values
     phase[1] = createElt(0, 0, make_cuDoubleComplex(1.0, 0.0));
     phase[2] = createElt(1, 1, make_cuDoubleComplex(cos(phi), sin(phi)));
@@ -314,26 +424,25 @@ phase(double phi) {
 __device__ void
 tensor(sparse_elt* gate1, sparse_elt* gate2, sparse_elt* gateScratch, int gate_n, long gateLen, bool *successDevice) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
-
     long num1 = gate1[0].u;
     long num2 = gate2[0].u;
     long dim1 = gate1[0].v;
     long dim2 = gate2[0].v;
+    int numPerThread = max(num1 / (blockDim.x * gridDim.x), 1L);
+
     if(gate_n != 0 && (num1-1) * (num2 - 1) > gateLen) {
-        *successDevice = false;
+        if(id == 0) { *successDevice = false; }
         __syncthreads();
         return;
     }
     else{
-        *successDevice = true;
+        if(id == 0) { *successDevice = true; }
         __syncthreads();
     }
 
     if(id == 0) {
-        gateScratch[0] = createElt((num1-1) * (num2-1) + 1, dim1 * dim2, make_cuDoubleComplex(0.0, 0.0));
+        gateScratch[0] = createElt((num1-1)*(num2-1)+1, dim1 * dim2, make_cuDoubleComplex(0.0, 0.0));
     }
-
-    int numPerThread = max(num1 / (blockDim.x * gridDim.x), 1L);
 
     for(long i = (id * numPerThread) + 1; i < (((id + 1) * numPerThread) + 1) && i < num1; ++i) {
         for(long j = 1; j < num2; ++j) {
@@ -359,7 +468,7 @@ tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen,
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ sparse_elt* U1;
     __shared__ sparse_elt* I;
-    if(id == 0) {
+    if(threadIdx.x == 0) {
         I = identity();
         switch(whichGate){
             case HADAMARD:
@@ -391,8 +500,8 @@ tensorKernel(sparse_elt* gate, sparse_elt* gateScratch, long gateLen,
         if(gate_n == u) { tensor(gate, U1, gateScratch, gate_n, gateLen, successDevice); }
         else { tensor(gate, I, gateScratch, gate_n, gateLen, successDevice); }
     }
+    //if(id == 0) printOp(gateScratch);
 }
-
 /* Two qubit gates */
 
 /* Does not need to check if gate has capacity enough, because CNOT has exactly 2^n nonzero
@@ -422,12 +531,34 @@ mult(sparse_elt* U1, int whichIndex, cuDoubleComplex* ans) {
             ans[U1[i].u] = U1[i].amp;
         }
     }
+    //printf("%f\n",cuCabs(ans[0]));
 }
-
 __global__ void
-CU1Expanded(sparse_elt* gate, sparse_elt* U1, int* eltsPerThread, const int n, const long N, const int u, const int v, long gateLen, bool* successDevice) {
+CU1ExpandedSetup(OneQubitGateType whichGate, double param, int* eltsPerThread, const int n, const long N, const int u, const int v, long gateLen, bool* successDevice) {
+    
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
+
+    __shared__ sparse_elt* U1;
+    if(threadIdx.x == 0) {
+        switch(whichGate){
+            case HADAMARD:
+            U1 = hadamard();
+            break;
+            
+            case NOT:
+            U1 = naught();
+            break;
+            
+            case IDENTITY:
+            U1 = identity();
+            break;
+
+            case PHASE:
+            U1 = phase(param);
+            break;
+        }
+    }
 
     if((N/4) * ((U1[0].u) + 1) > gateLen) {
         if(id == 0) { *successDevice = false; }
@@ -435,10 +566,9 @@ CU1Expanded(sparse_elt* gate, sparse_elt* U1, int* eltsPerThread, const int n, c
     } else {
         if(id == 0) { *successDevice = true; }
     }
-    gate[0] = createElt(N+1, N, make_cuDoubleComplex(0.0, 0.0));
     cuDoubleComplex stateOfV[2];
     int numEltsForThisThread = 0;
-    for(long i = id * numPerThread + 1; i < (id + 1) * numPerThread && i < N; ++i) {
+    for(long i = id * numPerThread; i < (id + 1) * numPerThread && i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             mult(U1, (i>>(n-v-1)) & 0x1, stateOfV);
             if(!equalsZero(stateOfV[0])) {
@@ -452,45 +582,74 @@ CU1Expanded(sparse_elt* gate, sparse_elt* U1, int* eltsPerThread, const int n, c
         }
     }
     eltsPerThread[id] = numEltsForThisThread;
-    scan(eltsPerThread, id);
-    for(long i = id * numPerThread + 1; i < (id + 1) * numPerThread && i < N; ++i) {
+}
+
+__global__ void
+CU1Expanded(sparse_elt* gate, OneQubitGateType whichGate, double param, int* startIndices, const int n, const long N, const int u, const int v) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
+    
+    __shared__ sparse_elt* U1;
+    if(threadIdx.x == 0) {
+        switch(whichGate){
+            case HADAMARD:
+            U1 = hadamard();
+            break;
+            
+            case NOT:
+            U1 = naught();
+            break;
+            
+            case IDENTITY:
+            U1 = identity();
+            break;
+
+            case PHASE:
+            U1 = phase(param);
+            break;
+        }
+    }
+    
+    cuDoubleComplex stateOfV[2];
+    gate[0] = createElt(N+1, N, make_cuDoubleComplex(0.0, 0.0));
+    int j = 0;
+    for(long i = id * numPerThread; i < (id + 1) * numPerThread && i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
             mult(U1, (i>>(n-v-1)) & 0x1, stateOfV);
             if(!equalsZero(stateOfV[0])) {
-                //gate[someIndex] = createElt(i, i & ~(0x1L<<(n-v-1)), stateOfV[0]);
+                gate[startIndices[id]+j+1] = createElt(i, i & ~(0x1L<<(n-v-1)), stateOfV[0]);
+                j++;
             }
             if(!equalsZero(stateOfV[1])) {
-                //gate[someIndex] = createElt(i, i | (0x1L<<(n-v-1)), stateOfV[1]);
+                gate[startIndices[id]+j+1] = createElt(i, i | (0x1L<<(n-v-1)), stateOfV[1]);
+                j++;
             }
         } else {
-            //gate[someIndex] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
+            gate[startIndices[id]+j+1] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
+            j++;
         }
     }
 }
-/*
-vector<sparse_elt> CPhase(const int n, const int u, const int v, double phi) {
-    return CU1Expanded(phase(phi), n, u, v);
-}*/
-/*
-vector<sparse_elt> swapExpanded(const int n, const int u, const int v) {
+
+__global__ void
+SWAPExpanded(sparse_elt* gate, const int n, const long N, const int u, const int v) {
     assert(u != v);
-    vector<sparse_elt> swp;
-    long N = pow(2, n);
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int numPerThread = max(N / (blockDim.x * gridDim.x), 1L);
     //dimensions
-    swp.push_back(createElt(N, N, 0.0));
+    gate[0] = createElt(N+1, N, make_cuDoubleComplex(0.0, 0.0));
     // values
     int j;
-    for(int i = 0; i < N; ++i) {
+    for(int i = id * numPerThread; i < (id+1) * numPerThread && i < N; ++i) {
         if ((i>>(n-u-1) & 0x1) ^ (i>>(n-v-1) & 0x1)) {
             j = (i ^ (0x1<<(n-u-1))) ^ (0x1<<(n-v-1));
-            swp.push_back(createElt(i, j, 1.0));
+            gate[i+1] = createElt(i, j, make_cuDoubleComplex(1.0, 0.0));
         } else {
-            swp.push_back(createElt(i, i, 1.0));
+            gate[i+1] = createElt(i, i, make_cuDoubleComplex(1.0, 0.0));
         }
     }
-    return swp;
 }
-*/
+
 
 /* Call swapPtrs after every applyOperator and every tensor product. */
 void swapPtrsState(cuDoubleComplex** state, cuDoubleComplex** stateScratch, const int N, const int blocks, const int threadsPerBlock) {
@@ -510,7 +669,9 @@ void swapPtrsGate(sparse_elt** state, sparse_elt** stateScratch) {
 
 __global__ void
 applyOperatorKernel(cuDoubleComplex* state, cuDoubleComplex* stateScratch, sparse_elt* gate) {
+
     int id = blockIdx.x * blockDim.x + threadIdx.x;
+
     long numElts = gate[0].u;
     int numPerThread = max(numElts / (blockDim.x * gridDim.x), 1L);
     for(int i = (id * numPerThread) + 1; i < ((id+1)*numPerThread) + 1 && i < numElts; ++i) {
@@ -537,11 +698,13 @@ void applyOneQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
             gate_n = 0;
         }
         tensorKernel<<<blocks, threadsPerBlock>>> (*gate, *gateScratch, *gateLen, whichGate, param, u, gate_n, successDevice);
+        cudaDeviceSynchronize();
         swapPtrsGate(gate, gateScratch);
         cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
         gate_n++;
     } while (!(success && gate_n >= n));
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
+    cudaDeviceSynchronize();
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
     cudaFree(successDevice);
 }
@@ -554,27 +717,47 @@ void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
     cudaMalloc((void**)&successDevice, sizeof(bool));
     bool success = true;
     cudaMemcpy(successDevice, &success, sizeof(bool), cudaMemcpyHostToDevice);
-    do {
-        if (!success) {
-            cudaFree(*gate);
-            cudaFree(*gateScratch);
-            *gateLen = (*gateLen) * 2;
-            cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
-            cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
-        }
-        switch(whichGate){
-            case CNOT:
-            CNOTExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
-            break;
-            
-            /*case CPhase:
-            CPhaseExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v, *gateLen, successDevice);
-            break;*/
-        }
-        cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
-    } while (!success);
+    if (!success) {
+        cudaFree(*gate);
+        cudaFree(*gateScratch);
+        *gateLen = (*gateLen) * 2;
+        cudaMalloc((void**)gate, (*gateLen + 1) * sizeof(sparse_elt));
+        cudaMalloc((void**)gateScratch, (*gateLen + 1) * sizeof(sparse_elt));
+    }
+    switch(whichGate){
+        case CNOT:
+        CNOTExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
+        cudaDeviceSynchronize();
+        break;
+        
+        case CPHASE:
+        int *numPerThread;
+        cudaMalloc((void**)&numPerThread, sizeof(int) * blocks * threadsPerBlock);
+
+        do {
+            CU1ExpandedSetup<<<blocks, threadsPerBlock>>> (PHASE, param, numPerThread, n, N, u, v, *gateLen, successDevice);
+            cudaDeviceSynchronize();
+            cudaMemcpy(&success, successDevice, sizeof(bool), cudaMemcpyDeviceToHost);
+        } while (!success);
+
+        int *startIndices;
+        cudaMalloc((void**)&startIndices, sizeof(int) * blocks * threadsPerBlock);
+
+        cudaScan(numPerThread, (blocks * threadsPerBlock), startIndices);
+        cudaDeviceSynchronize();
+        CU1Expanded<<<blocks, threadsPerBlock>>>(*gate, PHASE, param, startIndices, n, N, u, v);
+        cudaDeviceSynchronize();
+        cudaFree(numPerThread);
+        cudaFree(startIndices);
+        break;
+        
+        case SWAP:
+        SWAPExpanded<<<blocks, threadsPerBlock>>>(*gate, n, N, u, v);
+        break;
+    }
     
     applyOperatorKernel<<<blocks, threadsPerBlock>>> (*state, *stateScratch, *gate);
+    cudaDeviceSynchronize();
     swapPtrsState(state, stateScratch, N, blocks, threadsPerBlock);
     cudaFree(successDevice);
 }
@@ -584,38 +767,39 @@ void applyTwoQubitOperator(cuDoubleComplex** state, cuDoubleComplex** stateScrat
 /* Pi estimation functions for benchmarking performance. */
 
 /* Inverse quantum fourier transform */
-/*
-vector<complex<double> > qft_dagger(vector<complex<double> > state, const int n) {
+
+void qft_dagger(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate, sparse_elt** gateScratch,
+                long* gateLen, const int n, const int blocks, const int threadsPerBlock) {
     const int n_prime = n+1;
+    const long N = pow(2, n_prime);
     for (int i = 0; i < n/2; ++i) {
-        state = applyOperator(state, swapExpanded(n_prime, i, n-i-1));    
+        applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, i, n-i-1, SWAP, NO_PARAM, blocks, threadsPerBlock);   
     }
     for (int j = 0; j < n; ++j) {
         for (int m = 0; m < j; ++m) {
             double phi = -M_PI / ((double)pow(2, j - m));
-            state = applyOperator(state, CPhase(n_prime, j, m, phi)); 
+            applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, j, m, CPHASE, phi, blocks, threadsPerBlock); 
         }
-        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, j));
+        applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, j, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
     }
-    return state;
-}*/
+}
 
 // Setup for quantum phase estimation. 
-cuDoubleComplex* qpe_pre(const int n, const int blocks, const int threadsPerBlock){
+void qpe_pre(cuDoubleComplex** state, cuDoubleComplex** stateScratch, sparse_elt** gate, sparse_elt** gateScratch,
+                         long* gateLen, const int n, const int blocks, const int threadsPerBlock) {
     const int n_prime = n+1;
     const long N = pow(2, n_prime);
-    cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
-    /*for (int i = 0; i < n; ++i) {
-        state = applyOperator(state, oneQubitGateExpand(hadamard(), n_prime, i));    
+
+    for (int i = 0; i < n; ++i) {
+        applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, i, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
     }
-    state = applyOperator(state, oneQubitGateExpand(naught(), n_prime, n));
+    applyOneQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, n, NOT, NO_PARAM, blocks, threadsPerBlock); 
 
     for (int i = n-1; i >= 0; --i) {
         for (int j = 0; j < pow(2, n-i-1); ++j) {
-            state = applyOperator(state, CPhase(n_prime, n, n-i-1, 1.0));
+            applyTwoQubitOperator(state, stateScratch, gate, gateScratch, n_prime, N, gateLen, n, n-i-1, CPHASE, 1.0, blocks, threadsPerBlock); 
         }
-    }*/
-    return state;
+    }
 }
 
 /* The bits we want for this task are from 1 to n inclusive, since the 0 bit is our extra for
@@ -629,8 +813,9 @@ long getCorrectBitsForPiEstimate(long bits, int n){
     return answer;
 }
 
-int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int threadsPerBlock){
-    //cuDoubleComplex* state = uniform(N, blocks, threadsPerBlock);
+double gpu_get_pi_estimate(const int n, const int blocks, const int threadsPerBlock){
+    const int n_prime = n+1;
+    const long N = pow(2, n_prime);
     cuDoubleComplex* state = classical(N, 0, blocks, threadsPerBlock);
     cuDoubleComplex* stateScratch = zero(N, blocks, threadsPerBlock);
     sparse_elt* gate;
@@ -638,44 +823,40 @@ int gpu_get_pi_estimate(const int n, const int N, const int blocks, const int th
     cudaMalloc((void**)&gate, (N + 1) * sizeof(sparse_elt));
     cudaMalloc((void**)&gateScratch, (N + 1) * sizeof(sparse_elt));
     long gateLen = N;
-    //cuDoubleComplex* state = qpe_pre(n, N, blocks, threadsPerBlock);
+
+    qpe_pre(&state, &stateScratch, &gate, &gateScratch, &gateLen, n, blocks, threadsPerBlock);
+    qft_dagger(&state, &stateScratch, &gate, &gateScratch, &gateLen, n, blocks, threadsPerBlock);
+    
+    long mostLikely = getMostLikelyHost(state, n_prime, N, blocks, threadsPerBlock);
+    //cout << mostLikely << endl;
+    double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0, n);
+    
+    //printVec(state, n_prime, N, false);
+    printVecProbs(state, n_prime, N, false);
+    
+    
+    cout << "IsNormalized " << isNormalized(state, N, blocks, threadsPerBlock) << endl;
     cudaDeviceSynchronize();
-    applyOneQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 0, HADAMARD, NO_PARAM, blocks, threadsPerBlock); 
-    applyTwoQubitOperator(&state, &stateScratch, &gate, &gateScratch, n, N, &gateLen, 0, 1, CNOT, NO_PARAM, blocks, threadsPerBlock); 
-    
-    printVec(state, n, N, false);
-    //printVecProbs(state, n, N, false);
-    
-    
-    //cout << isNormalized(state, N, blocks, threadsPerBlock) << endl;
     cudaFree(state);
     cudaFree(stateScratch);
     cudaFree(gate);
     cudaFree(gateScratch);
-    cudaDeviceSynchronize();
-    return 0;
+    return 1.0 / (2 * theta);
 }
 
 int main(){
     int n = 2;
-    long N = pow(2, n);
+    long long int N = pow(2, n+1); //Just for this purpose since we have an extra qubit in the circuit.
     int threadsPerBlock = 256;
-    int blocks = (threadsPerBlock + N - 1)/threadsPerBlock;
-    
+    int blocks = (N + threadsPerBlock - 1)/threadsPerBlock;
+
     //gpu time includes time for allocation, transfer, and execution
     double gpu_start_time = CycleTimer::currentSeconds();
-    gpu_get_pi_estimate(n, N, blocks, threadsPerBlock);
+    cout << gpu_get_pi_estimate(n, blocks, threadsPerBlock) << endl;
     double gpu_end_time = CycleTimer::currentSeconds();
     
     //TODO Add Bandwidth Calculation
     printf("Total GPU Time: %.3f ms\n", 1000.f * (gpu_end_time-gpu_start_time));
-    /*
-    double cpu_start_time = CycleTimer::currentSeconds();
-    get_pi_estimate(n, N, blocks, threadsPerBlock);
-    double cpu_end_time = CycleTimer::currentSeconds();
-
-    printf("Total CPU Time: %.3f ms\t\t", 1000.f * (cpu_end_time-cpu_start_time));
-    */
 
     return 0;
 }

@@ -217,7 +217,7 @@ vector<sparse_elt> CU1Expanded(vector<sparse_elt> U1, const int n, const int u, 
     vector<complex<double> > stateOfV;
     for(long i = 0; i < N; ++i) {
         if (i>>(n-u-1) & 0x1) {
-            stateOfV = classical(1, (i>>(n-v-1)) & 0x1);
+            stateOfV = classical(2, (i>>(n-v-1)) & 0x1);
             stateOfV = applyOperator(stateOfV, U1);
             if(!equalsZero(stateOfV.data()[0])) {
                 CU1.push_back(createElt(i, i & ~(0x1L<<(n-v-1)), stateOfV.data()[0]));
@@ -304,13 +304,14 @@ long getCorrectBitsForPiEstimate(long bits, int n){
 double get_pi_estimate(const int n) {
     vector<complex<double> > state = qpe_pre(n);
     state = qft_dagger(state, n);
+    //printVec(state, n, pow(2, n), false);
     long mostLikely = getMostLikely(state, n+1);
     double theta = (double)(getCorrectBitsForPiEstimate(mostLikely, n)) / pow(2.0,n);
     return 1.0 / (2 * theta);
 }
 
 int main() {
-    const int n = 12;
+    const int n = 10;
     //const int N = pow(2, n);
 
     cout << get_pi_estimate(n) << endl;
@@ -318,7 +319,7 @@ int main() {
     
     
     //Testing functions out
-    /*vector<complex<double> > state = classical(N, 0);*/
+    //vector<complex<double> > state = classical(N, 0);
 
     
     /* Uniform superposition: */
